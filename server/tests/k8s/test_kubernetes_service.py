@@ -17,7 +17,6 @@ Unit tests for KubernetesSandboxService.
 """
 
 import pytest
-import pytest_asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 from fastapi import HTTPException
@@ -134,6 +133,7 @@ class TestKubernetesSandboxServiceCreate:
         sandbox_create_poll_interval_seconds are read from KubernetesRuntimeConfig
         and forwarded to _wait_for_sandbox_ready.
         """
+
 
         k8s_service.workload_provider.create_workload.return_value = {
             "name": "test-sandbox-123",
