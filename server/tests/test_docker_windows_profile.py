@@ -20,8 +20,10 @@ from fastapi import HTTPException
 from opensandbox_server.api.schema import PlatformSpec
 from opensandbox_server.services.docker_windows_profile import (
     apply_windows_runtime_host_config_defaults,
+    inject_windows_resource_limits_env,
     inject_windows_user_ports,
     resolve_docker_platform,
+    validate_windows_resource_limits,
     validate_windows_runtime_prerequisites,
 )
 
@@ -84,5 +86,66 @@ def test_inject_windows_user_ports_merges_existing_value():
     env = ["USER_PORTS=3389,44772", "VERSION=11"]
     updated = inject_windows_user_ports(env, ["44772", "8080"])
     assert "USER_PORTS=3389,44772,8080" in updated
+
+
+def test_inject_windows_resource_limits_env_from_resource_limits():
+    env = ["VERSION=11"]
+    updated = inject_windows_resource_limits_env(
+        env,
+        {
+            "cpu": "4",
+            "memory": "8G",
+            "disk": "64G",
+        },
+    )
+    assert "VERSION=11" in updated
+    assert "CPU_CORES=4" in updated
+    assert "RAM_SIZE=8G" in updated
+    assert "DISK_SIZE=64G" in updated
+
+
+def test_inject_windows_resource_limits_env_overrides_existing_env():
+    env = ["CPU_CORES=1", "RAM_SIZE=1G", "DISK_SIZE=20G", "VERSION=11"]
+    updated = inject_windows_resource_limits_env(
+        env,
+        {
+            "cpu": "2500m",
+            "memory": "8192Mi",
+            "storage": "100Gi",
+        },
+    )
+    assert "CPU_CORES=3" in updated
+    assert "RAM_SIZE=8G" in updated
+    assert "DISK_SIZE=100G" in updated
+    assert "CPU_CORES=1" not in updated
+    assert "RAM_SIZE=1G" not in updated
+    assert "DISK_SIZE=20G" not in updated
+
+
+def test_validate_windows_resource_limits_accepts_minimum_values():
+    validate_windows_resource_limits(
+        {
+            "cpu": "2",
+            "memory": "4G",
+            "disk": "64G",
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("resource_limits", "expected_message_fragment"),
+    [
+        ({"cpu": "1500m"}, "resourceLimits.cpu >= 2"),
+        ({"memory": "3G"}, "resourceLimits.memory >= 4G"),
+        ({"disk": "63G"}, "resourceLimits.disk"),
+    ],
+)
+def test_validate_windows_resource_limits_rejects_values_below_minimum(
+    resource_limits, expected_message_fragment
+):
+    with pytest.raises(HTTPException) as exc_info:
+        validate_windows_resource_limits(resource_limits)
+    assert exc_info.value.status_code == 400
+    assert expected_message_fragment in exc_info.value.detail["message"]
 
 

@@ -1313,6 +1313,39 @@ async def test_create_sandbox_windows_profile_rejects_missing_runtime_devices(mo
 
 @pytest.mark.asyncio
 @patch("opensandbox_server.services.docker.docker")
+async def test_create_sandbox_windows_profile_rejects_below_minimum_resource_limits(mock_docker):
+    mock_client = MagicMock()
+    mock_client.containers.list.return_value = []
+    mock_docker.from_env.return_value = mock_client
+
+    cfg = _app_config()
+    cfg.runtime.execd_image = "ghcr.io/opensandbox/execd:v1.0.11"
+    cfg.docker.network_mode = "bridge"
+    service = DockerSandboxService(config=cfg)
+    request = CreateSandboxRequest(
+        image=ImageSpec(uri="dockurr/windows:latest"),
+        resourceLimits=ResourceLimits(root={"cpu": "1", "memory": "2G", "disk": "32G"}),
+        entrypoint=["cmd", "/c", "echo ready"],
+        platform=PlatformSpec(os="windows", arch="amd64"),
+    )
+    with (
+        patch(
+            "opensandbox_server.services.docker.validate_windows_runtime_prerequisites",
+            return_value=None,
+        ),
+        patch.object(service, "_create_and_start_container") as mock_create,
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await service.create_sandbox(request)
+
+    assert exc_info.value.status_code == status.HTTP_400_BAD_REQUEST
+    assert exc_info.value.detail["code"] == SandboxErrorCodes.INVALID_PARAMETER
+    assert "resourceLimits.cpu >= 2" in exc_info.value.detail["message"]
+    mock_create.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("opensandbox_server.services.docker.docker")
 async def test_create_sandbox_windows_profile_accepts_dockur_demo_like_request(mock_docker):
     """
     Use a dockur/windows-style request payload (VERSION env) and verify
@@ -1328,7 +1361,13 @@ async def test_create_sandbox_windows_profile_accepts_dockur_demo_like_request(m
     service = DockerSandboxService(config=cfg)
     request = CreateSandboxRequest(
         image=ImageSpec(uri="dockurr/windows:latest"),
-        resourceLimits=ResourceLimits(root={}),
+        resourceLimits=ResourceLimits(
+            root={
+                "cpu": "4",
+                "memory": "8G",
+                "disk": "64G",
+            }
+        ),
         env={"VERSION": "11"},
         entrypoint=["cmd", "/c", "echo ready"],
         platform=PlatformSpec(os="windows", arch="amd64"),
@@ -1351,6 +1390,9 @@ async def test_create_sandbox_windows_profile_accepts_dockur_demo_like_request(m
 
     forwarded_env = mock_create.call_args.args[4]
     assert "VERSION=11" in forwarded_env
+    assert "CPU_CORES=4" in forwarded_env
+    assert "RAM_SIZE=8G" in forwarded_env
+    assert "DISK_SIZE=64G" in forwarded_env
     assert "USER_PORTS=44772,8080,3389,8006" in forwarded_env
     assert response.platform is not None
     assert response.platform.os == "windows"

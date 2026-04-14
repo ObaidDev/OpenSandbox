@@ -68,11 +68,13 @@ from opensandbox_server.services.docker_windows_profile import (
     apply_windows_runtime_host_config_defaults,
     fetch_execd_install_bat,
     fetch_execd_windows_binary,
+    inject_windows_resource_limits_env,
     inject_windows_user_ports,
     install_windows_oem_scripts,
     is_windows_platform,
     normalize_bootstrap_command,
     resolve_docker_platform,
+    validate_windows_resource_limits,
     validate_windows_runtime_prerequisites,
 )
 from opensandbox_server.services.extension_service import ExtensionService
@@ -1156,6 +1158,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, OSSFSMixin, SandboxService, E
         requested_windows_profile = is_windows_platform(request.platform)
 
         if requested_windows_profile:
+            validate_windows_resource_limits(request.resource_limits.root or {})
             validate_windows_runtime_prerequisites()
 
         # Prepare OSSFS mounts first so binds can reference mounted host paths.
@@ -1223,6 +1226,10 @@ class DockerSandboxService(DockerDiagnosticsMixin, OSSFSMixin, SandboxService, E
                 host_config_kwargs = apply_windows_runtime_host_config_defaults(
                     host_config_kwargs,
                     sandbox_id,
+                )
+                environment = inject_windows_resource_limits_env(
+                    environment,
+                    request.resource_limits.root or {},
                 )
                 environment = inject_windows_user_ports(environment, exposed_ports)
 
