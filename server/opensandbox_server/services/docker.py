@@ -1273,6 +1273,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, OSSFSMixin, SandboxService, E
                         cleanup_exc,
                     )
             self._release_ossfs_mounts(ossfs_mount_keys)
+            self._cleanup_managed_volumes(sandbox_id, auto_created_volumes or [])
             raise
 
         status_info = SandboxStatus(
@@ -1400,16 +1401,23 @@ class DockerSandboxService(DockerDiagnosticsMixin, OSSFSMixin, SandboxService, E
 
         pvc_inspect_cache: dict[str, dict] = {}
         auto_created_volumes: list[str] = []
-        for volume in request.volumes:
-            if volume.host is not None:
-                self._validate_host_volume(volume, allowed_prefixes)
-            elif volume.pvc is not None:
-                vol_info, was_created = self._validate_pvc_volume(volume)
-                pvc_inspect_cache[volume.pvc.claim_name] = vol_info
-                if was_created and volume.pvc.delete_on_sandbox_termination:
-                    auto_created_volumes.append(volume.pvc.claim_name)
-            elif volume.ossfs is not None:
-                self._validate_ossfs_volume(volume)
+        try:
+            for volume in request.volumes:
+                if volume.host is not None:
+                    self._validate_host_volume(volume, allowed_prefixes)
+                elif volume.pvc is not None:
+                    vol_info, was_created = self._validate_pvc_volume(volume)
+                    pvc_inspect_cache[volume.pvc.claim_name] = vol_info
+                    if was_created and volume.pvc.delete_on_sandbox_termination:
+                        auto_created_volumes.append(volume.pvc.claim_name)
+                elif volume.ossfs is not None:
+                    self._validate_ossfs_volume(volume)
+        except Exception:
+            # If any subsequent volume validation fails, remove volumes we
+            # already auto-created so they don't leak — delete_sandbox will
+            # never run for a sandbox that was never provisioned.
+            self._cleanup_managed_volumes("<pre-sandbox>", auto_created_volumes)
+            raise
 
         return pvc_inspect_cache, auto_created_volumes
 
