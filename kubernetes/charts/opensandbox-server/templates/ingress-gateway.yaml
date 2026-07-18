@@ -74,7 +74,12 @@ spec:
             - "--namespace={{ .Values.server.gateway.dataplaneNamespace }}"
             - "--port={{ .Values.server.gateway.port }}"
             - "--provider-type={{ .Values.server.gateway.providerType }}"
-            - "--mode={{ .Values.server.gateway.gatewayRouteMode }}"
+            {{- /* The gateway binary only understands "header" and "uri". The server's
+                   "wildcard" route mode (per-sandbox subdomains like <id>-<port>.<domain>)
+                   is parsed by the gateway's "header" mode via the Host header, so
+                   translate wildcard -> header for the binary while the server config
+                   keeps route.mode = wildcard. */}}
+            - "--mode={{ if eq .Values.server.gateway.gatewayRouteMode "wildcard" }}header{{ else }}{{ .Values.server.gateway.gatewayRouteMode }}{{ end }}"
             - "--log-level={{ .Values.server.gateway.logLevel }}"
 {{- if .Values.server.gateway.secureAccess.keys }}
             - "--secure-access-keys={{- range $i, $k := .Values.server.gateway.secureAccess.keys }}{{ if $i }},{{ end }}{{ $k.key_id }}={{ $k.key }}{{- end }}"
