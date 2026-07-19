@@ -25,17 +25,21 @@ to ensure consistent pooling/proxy/retry behavior across services.
 """
 
 from opensandbox.adapters.command_adapter import CommandsAdapter
+from opensandbox.adapters.diagnostics_adapter import DiagnosticsAdapter
 from opensandbox.adapters.egress_adapter import EgressAdapter
 from opensandbox.adapters.filesystem_adapter import FilesystemAdapter
 from opensandbox.adapters.health_adapter import HealthAdapter
+from opensandbox.adapters.isolated_adapter import IsolatedSessionsAdapter
 from opensandbox.adapters.metrics_adapter import MetricsAdapter
 from opensandbox.adapters.sandboxes_adapter import SandboxesAdapter
 from opensandbox.config import ConnectionConfig
 from opensandbox.models.sandboxes import SandboxEndpoint
 from opensandbox.services.command import Commands
+from opensandbox.services.diagnostics import Diagnostics
 from opensandbox.services.egress import Egress
 from opensandbox.services.filesystem import Filesystem
 from opensandbox.services.health import Health
+from opensandbox.services.isolated import IsolationService
 from opensandbox.services.metrics import Metrics
 from opensandbox.services.sandbox import Sandboxes
 
@@ -69,6 +73,10 @@ class AdapterFactory:
             Service for creating, managing, and monitoring sandbox instances
         """
         return SandboxesAdapter(self.connection_config)
+
+    def create_diagnostics_service(self) -> Diagnostics:
+        """Create a diagnostics service for sandbox troubleshooting operations."""
+        return DiagnosticsAdapter(self.connection_config)
 
     def create_filesystem_service(self, endpoint: SandboxEndpoint) -> Filesystem:
         """Create a filesystem service for file and directory operations.
@@ -117,3 +125,16 @@ class AdapterFactory:
             Service for collecting sandbox resource usage metrics
         """
         return MetricsAdapter(self.connection_config, endpoint)
+
+    def create_isolated_session_service(
+        self, endpoint: SandboxEndpoint
+    ) -> IsolationService:
+        """Create an isolated session service for namespace-isolated execution.
+
+        Args:
+            endpoint: Sandbox endpoint information for isolated session operations
+
+        Returns:
+            Service for managing isolated bash sessions
+        """
+        return IsolatedSessionsAdapter(self.connection_config, endpoint)

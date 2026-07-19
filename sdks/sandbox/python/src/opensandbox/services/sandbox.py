@@ -23,8 +23,11 @@ from datetime import datetime, timedelta
 from typing import Protocol
 
 from opensandbox.models.sandboxes import (
+    CreateSnapshotRequest,
+    CredentialProxyConfig,
     NetworkPolicy,
     PagedSandboxInfos,
+    PagedSnapshotInfos,
     PlatformSpec,
     SandboxCreateResponse,
     SandboxEndpoint,
@@ -32,6 +35,8 @@ from opensandbox.models.sandboxes import (
     SandboxImageSpec,
     SandboxInfo,
     SandboxRenewResponse,
+    SnapshotFilter,
+    SnapshotInfo,
     Volume,
 )
 
@@ -46,8 +51,8 @@ class Sandboxes(Protocol):
 
     async def create_sandbox(
         self,
-        spec: SandboxImageSpec,
-        entrypoint: list[str],
+        spec: SandboxImageSpec | None,
+        entrypoint: list[str] | None,
         env: dict[str, str],
         metadata: dict[str, str],
         timeout: timedelta | None,
@@ -57,6 +62,9 @@ class Sandboxes(Protocol):
         volumes: list[Volume] | None,
         platform: PlatformSpec | None = None,
         secure_access: bool = False,
+        snapshot_id: str | None = None,
+        credential_proxy: CredentialProxyConfig | None = None,
+        resource_requests: dict[str, str] | None = None,
     ) -> SandboxCreateResponse:
         """
         Create a new sandbox with the specified configuration.
@@ -69,6 +77,7 @@ class Sandboxes(Protocol):
             timeout: Sandbox lifetime. Pass None to create a sandbox that requires explicit cleanup.
             resource: Runtime resource limits (e.g. cpu/memory). Exact semantics are server-defined.
             network_policy: Optional outbound network policy (egress).
+            credential_proxy: Optional Credential Vault proxy startup settings.
             extensions: Opaque extension parameters passed through to the server as-is.
                 Prefer namespaced keys (e.g. ``storage.id``).
             volumes: Optional list of volume mounts for persistent storage.
@@ -106,6 +115,24 @@ class Sandboxes(Protocol):
 
         Returns:
             List of sandbox information matching the filter
+
+        Raises:
+            SandboxException: if the operation fails
+        """
+        ...
+
+    async def patch_sandbox_metadata(
+        self, sandbox_id: str, patch: dict[str, str | None]
+    ) -> SandboxInfo:
+        """
+        Patch sandbox metadata.
+
+        Args:
+            sandbox_id: Unique identifier of the sandbox
+            patch: Metadata merge patch. String values add or replace keys; None deletes keys.
+
+        Returns:
+            Current sandbox information after applying the patch
 
         Raises:
             SandboxException: if the operation fails
@@ -204,4 +231,26 @@ class Sandboxes(Protocol):
         Raises:
             SandboxException: if the operation fails
         """
+        ...
+
+    async def create_snapshot(
+        self, sandbox_id: str, request: CreateSnapshotRequest | None = None
+    ) -> SnapshotInfo:
+        """Create a persistent snapshot from a sandbox."""
+        ...
+
+    async def get_snapshot(self, snapshot_id: str) -> SnapshotInfo:
+        """Retrieve information about an existing snapshot."""
+        ...
+
+    async def list_snapshots(self, filter: SnapshotFilter) -> PagedSnapshotInfos:
+        """List snapshots with optional filtering."""
+        ...
+
+    async def delete_snapshot(self, snapshot_id: str) -> None:
+        """Delete a snapshot."""
+        ...
+
+    def invalidate_endpoint_cache(self, sandbox_id: str) -> None:
+        """Remove all cached endpoints for a sandbox. No-op if caching is disabled."""
         ...

@@ -18,6 +18,7 @@ package telemetry
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
 	"strings"
 
@@ -26,6 +27,7 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	"go.opentelemetry.io/otel/metric/noop"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
@@ -37,6 +39,14 @@ type Config struct {
 	ResourceAttributes []attribute.KeyValue
 	RegisterMetrics    func() error
 }
+
+const (
+	envOTLPMetricsEndpoint = "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"
+	envOTLPEndpoint        = "OTEL_EXPORTER_OTLP_ENDPOINT"
+	envHostIP              = "HOST_IP"
+	otlpHTTPPort           = "4318"
+	hostInfoPath           = "/etc/hostinfo"
+)
 
 // Init sets a noop TracerProvider, optionally MeterProvider with OTLP HTTP exporter.
 // Shutdown must be called on exit.
@@ -58,7 +68,10 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 	)
 
 	if metricsEnabled() {
-		mexp, err := otlpmetrichttp.New(ctx)
+		opts := append(metricsClientOptions(),
+			otlpmetrichttp.WithTemporalitySelector(deltaTemporalitySelector),
+		)
+		mexp, err := otlpmetrichttp.New(ctx, opts...)
 		if err != nil {
 			return nil, err
 		}
@@ -100,8 +113,55 @@ func buildResource(ctx context.Context, serviceName string, extra []attribute.Ke
 	return resource.New(ctx, opts...)
 }
 
+// Endpoint precedence: OTEL_EXPORTER_OTLP_*_ENDPOINT -> HOST_IP -> /etc/hostinfo.
 func metricsEnabled() bool {
-	return firstEndpoint(os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")) != ""
+	if otlpEndpointFromEnv() != "" {
+		return true
+	}
+	_, ok := resolveNodeIP()
+	return ok
+}
+
+func metricsClientOptions() []otlpmetrichttp.Option {
+	if otlpEndpointFromEnv() != "" {
+		return nil
+	}
+	ip, ok := resolveNodeIP()
+	if !ok {
+		return nil
+	}
+	return []otlpmetrichttp.Option{
+		otlpmetrichttp.WithEndpoint(net.JoinHostPort(ip, otlpHTTPPort)),
+		otlpmetrichttp.WithInsecure(),
+	}
+}
+
+func otlpEndpointFromEnv() string {
+	return firstEndpoint(os.Getenv(envOTLPMetricsEndpoint), os.Getenv(envOTLPEndpoint))
+}
+
+func resolveNodeIP() (string, bool) {
+	if ip := strings.TrimSpace(os.Getenv(envHostIP)); ip != "" && net.ParseIP(ip) != nil {
+		return ip, true
+	}
+	return readHostInfoIP(hostInfoPath)
+}
+
+func readHostInfoIP(path string) (string, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if net.ParseIP(line) != nil {
+			return line, true
+		}
+	}
+	return "", false
 }
 
 func firstEndpoint(primary, fallback string) string {
@@ -109,4 +169,17 @@ func firstEndpoint(primary, fallback string) string {
 		return s
 	}
 	return strings.TrimSpace(fallback)
+}
+
+// deltaTemporalitySelector returns delta temporality for monotonic instruments
+// (Counter, Histogram, ObservableCounter). Gauges and UpDownCounters keep
+// the default cumulative semantics.
+func deltaTemporalitySelector(kind sdkmetric.InstrumentKind) metricdata.Temporality {
+	switch kind {
+	case sdkmetric.InstrumentKindCounter,
+		sdkmetric.InstrumentKindHistogram:
+		return metricdata.DeltaTemporality
+	default:
+		return metricdata.CumulativeTemporality
+	}
 }

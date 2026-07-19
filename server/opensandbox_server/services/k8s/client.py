@@ -27,9 +27,16 @@ from kubernetes.client import ApiException, CoreV1Api, CustomObjectsApi, NodeV1A
 
 from opensandbox_server.config import KubernetesRuntimeConfig
 from opensandbox_server.services.k8s.informer import WorkloadInformer
+from opensandbox_server.services.k8s.label_selector import matches, parse_selector
 from opensandbox_server.services.k8s.rate_limiter import TokenBucketRateLimiter
 
 logger = logging.getLogger(__name__)
+
+OPENSANDBOX_API_GROUP = "sandbox.opensandbox.io"
+OPENSANDBOX_API_VERSION = "v1alpha1"
+POOL_KIND = "Pool"
+POOL_PLURAL = "pools"
+POOL_AUTO_ASSIGN_REF = "*"
 
 _InformerKey = Tuple[str, str, str, str]  # (group, version, plural, namespace)
 
@@ -87,6 +94,16 @@ class K8sClient:
         return self._node_v1_api
 
 
+    def _lookup_informer(self, group: str, version: str, plural: str, namespace: str) -> Optional[WorkloadInformer]:
+        """Return an existing informer without starting one. Used by write paths
+        to invalidate cache entries; never auto-create on writes since list paths
+        own the lazy-start contract."""
+        if not self.config.informer_enabled:
+            return None
+        key: _InformerKey = (group, version, plural, namespace)
+        with self._informers_lock:
+            return self._informers.get(key)
+
     def _get_informer(self, group: str, version: str, plural: str, namespace: str) -> Optional[WorkloadInformer]:
         """Return the informer for this resource+namespace, starting it lazily."""
         if not self.config.informer_enabled:
@@ -130,13 +147,17 @@ class K8sClient:
         """Create a namespaced custom resource."""
         if self._write_limiter:
             self._write_limiter.acquire()
-        return self.get_custom_objects_api().create_namespaced_custom_object(
+        obj = self.get_custom_objects_api().create_namespaced_custom_object(
             group=group,
             version=version,
             namespace=namespace,
             plural=plural,
             body=body,
         )
+        informer = self._lookup_informer(group, version, plural, namespace)
+        if informer:
+            informer.update_cache(obj)
+        return obj
 
     def get_custom_object(
         self,
@@ -183,7 +204,25 @@ class K8sClient:
         plural: str,
         label_selector: str = "",
     ) -> List[Dict[str, Any]]:
-        """List namespaced custom resources, returning the items list."""
+        """List namespaced custom resources, returning the items list.
+
+        Tries the informer cache first when available, synced, and the label
+        selector falls within the supported in-memory grammar. Falls back to
+        a direct API call (with rate limiting) otherwise.
+        """
+        informer = self._get_informer(group, version, plural, namespace)
+        if informer and informer.has_synced:
+            terms = parse_selector(label_selector)
+            if terms is not None:
+                cached = informer.list()
+                if not terms:
+                    return cached
+                return [
+                    obj
+                    for obj in cached
+                    if matches(obj.get("metadata", {}).get("labels") or {}, terms)
+                ]
+
         if self._read_limiter:
             self._read_limiter.acquire()
         try:
@@ -220,6 +259,9 @@ class K8sClient:
             name=name,
             grace_period_seconds=grace_period_seconds,
         )
+        informer = self._lookup_informer(group, version, plural, namespace)
+        if informer:
+            informer.delete_from_cache(name)
 
     def patch_custom_object(
         self,
@@ -233,7 +275,7 @@ class K8sClient:
         """Patch a namespaced custom resource."""
         if self._write_limiter:
             self._write_limiter.acquire()
-        return self.get_custom_objects_api().patch_namespaced_custom_object(
+        obj = self.get_custom_objects_api().patch_namespaced_custom_object(
             group=group,
             version=version,
             namespace=namespace,
@@ -241,6 +283,10 @@ class K8sClient:
             name=name,
             body=body,
         )
+        informer = self._lookup_informer(group, version, plural, namespace)
+        if informer:
+            informer.update_cache(obj)
+        return obj
 
     # ------------------------------------------------------------------
     # PersistentVolumeClaim operations
@@ -275,6 +321,60 @@ class K8sClient:
         return self.get_core_v1_api().create_namespaced_persistent_volume_claim(
             namespace=namespace,
             body=body,
+        )
+
+    def list_pvcs(
+        self,
+        namespace: str,
+        label_selector: str = "",
+    ) -> List[Any]:
+        """List PersistentVolumeClaims in a namespace, returning the items list."""
+        if self._read_limiter:
+            self._read_limiter.acquire()
+        result = self.get_core_v1_api().list_namespaced_persistent_volume_claim(
+            namespace=namespace,
+            label_selector=label_selector,
+        )
+        return list(getattr(result, "items", []) or [])
+
+    def delete_pvc(
+        self,
+        namespace: str,
+        name: str,
+    ) -> None:
+        """Delete a PersistentVolumeClaim by name. 404 is swallowed."""
+        if self._write_limiter:
+            self._write_limiter.acquire()
+        try:
+            self.get_core_v1_api().delete_namespaced_persistent_volume_claim(
+                name=name,
+                namespace=namespace,
+            )
+        except ApiException as e:
+            if e.status == 404:
+                return
+            raise
+
+    def patch_pvc(
+        self,
+        namespace: str,
+        name: str,
+        body: Any,
+    ) -> Any:
+        """Patch a PersistentVolumeClaim using strategic merge semantics.
+
+        The pinned kubernetes-client picks ``application/json-patch+json`` by
+        default (first entry in the generated content-type list) which would
+        reject our merge-shaped body. Force strategic-merge so list fields
+        like ``ownerReferences`` merge by key.
+        """
+        if self._write_limiter:
+            self._write_limiter.acquire()
+        return self.get_core_v1_api().patch_namespaced_persistent_volume_claim(
+            name=name,
+            namespace=namespace,
+            body=body,
+            _content_type="application/strategic-merge-patch+json",
         )
 
     # ------------------------------------------------------------------

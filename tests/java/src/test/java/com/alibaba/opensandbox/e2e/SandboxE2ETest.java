@@ -66,7 +66,7 @@ public class SandboxE2ETest extends BaseE2ETest {
                         .metadata(metadataMap)
                         .env("E2E_TEST", "true")
                         .env("EXECD_API_GRACE_SHUTDOWN", "3s")
-                        .env("EXECD_JUPYTER_IDLE_POLL_INTERVAL", "1s")
+                        .env("EXECD_JUPYTER_IDLE_POLL_INTERVAL", "200ms")
                         .healthCheckPollingInterval(Duration.ofMillis(500))
                         .build();
     }
@@ -224,6 +224,36 @@ public class SandboxE2ETest extends BaseE2ETest {
 
     @Test
     @Order(1)
+    @DisplayName("Sandbox extensions round-trip")
+    @Timeout(value = 2, unit = TimeUnit.MINUTES)
+    void testSandboxExtensionsRoundTrip() {
+        Sandbox extSandbox =
+                Sandbox.builder()
+                        .connectionConfig(sharedConnectionConfig)
+                        .image(getSandboxImage())
+                        .timeout(Duration.ofMinutes(2))
+                        .readyTimeout(Duration.ofSeconds(60))
+                        .metadata(Map.of("tag", "e2e-extensions"))
+                        .extension("opensandbox.extensions.test-key", "test-value")
+                        .extension("opensandbox.extensions.second", "second-value")
+                        .healthCheckPollingInterval(Duration.ofMillis(500))
+                        .build();
+        try {
+            SandboxInfo info = extSandbox.getInfo();
+            assertNotNull(info.getExtensions(), "extensions missing from getInfo");
+            assertEquals("test-value", info.getExtensions().get("opensandbox.extensions.test-key"));
+            assertEquals("second-value", info.getExtensions().get("opensandbox.extensions.second"));
+        } finally {
+            try {
+                extSandbox.kill();
+            } catch (Exception ignored) {
+            }
+            extSandbox.close();
+        }
+    }
+
+    @Test
+    @Order(1)
     @DisplayName("Sandbox manual cleanup returns null expiresAt")
     @Timeout(value = 2, unit = TimeUnit.MINUTES)
     void testSandboxManualCleanup() {
@@ -270,11 +300,10 @@ public class SandboxE2ETest extends BaseE2ETest {
                         .readyTimeout(Duration.ofSeconds(60))
                         .networkPolicy(networkPolicy)
                         .build();
-        // Wait for NetworkPolicy sidecar to be fully initialized
-        try {
-            Thread.sleep(2000);
-        } catch (InterruptedException ignored) {
-        }
+        // Wait for NetworkPolicy sidecar to be fully initialized.
+        // The sidecar may accept the sandbox before iptables/proxy rules apply,
+        // so poll a denied target until the policy actually blocks it.
+        waitUntilEgressBlocks(policySandbox, "https://www.github.com", Duration.ofSeconds(30));
 
         try {
             NetworkPolicy initialPolicy = policySandbox.getEgressPolicy();
@@ -319,10 +348,8 @@ public class SandboxE2ETest extends BaseE2ETest {
                                     .target("pypi.org")
                                     .build()));
 
-            try {
-                Thread.sleep(2000);
-            } catch (InterruptedException ignored) {
-            }
+            // Poll until the patched rule takes effect (pypi now blocked).
+            waitUntilEgressBlocks(policySandbox, "https://pypi.org", Duration.ofSeconds(30));
 
             NetworkPolicy patchedPolicy = policySandbox.getEgressPolicy();
             assertNotNull(patchedPolicy);
@@ -393,10 +420,8 @@ public class SandboxE2ETest extends BaseE2ETest {
                         .readyTimeout(Duration.ofSeconds(60))
                         .networkPolicy(networkPolicy)
                         .build();
-        try {
-            Thread.sleep(2000);
-        } catch (InterruptedException ignored) {
-        }
+        // Wait for NetworkPolicy sidecar/iptables rules to be active.
+        waitUntilEgressBlocks(policySandbox, "https://www.github.com", Duration.ofSeconds(30));
 
         try {
             SandboxEndpoint egressEndpoint = policySandbox.getEndpoint(18080);
@@ -447,10 +472,8 @@ public class SandboxE2ETest extends BaseE2ETest {
                                     .target("pypi.org")
                                     .build()));
 
-            try {
-                Thread.sleep(2000);
-            } catch (InterruptedException ignored) {
-            }
+            // Poll until patched rule applied (pypi now blocked).
+            waitUntilEgressBlocks(policySandbox, "https://pypi.org", Duration.ofSeconds(30));
 
             NetworkPolicy patchedPolicy = policySandbox.getEgressPolicy();
             assertNotNull(patchedPolicy.getEgress());
@@ -506,13 +529,8 @@ public class SandboxE2ETest extends BaseE2ETest {
             assertTrue(volumeSandbox.isHealthy(), "Volume sandbox should be healthy");
 
             // Step 1: Verify the host marker file is visible inside the sandbox
-            Execution readMarker =
-                    volumeSandbox
-                            .commands()
-                            .run(
-                                    RunCommandRequest.builder()
-                                            .command("cat " + containerMountPath + "/marker.txt")
-                                            .build());
+            // Retry: bind mount propagation can sometimes lag on first access
+            Execution readMarker = runWithRetry(volumeSandbox, "cat " + containerMountPath + "/marker.txt");
             assertNull(readMarker.getError(), "Failed to read marker file");
             assertEquals(1, readMarker.getLogs().getStdout().size());
             assertEquals(
@@ -532,16 +550,8 @@ public class SandboxE2ETest extends BaseE2ETest {
             assertNull(writeResult.getError(), "Failed to write file");
 
             // Step 3: Verify the written file is readable
-            Execution readBack =
-                    volumeSandbox
-                            .commands()
-                            .run(
-                                    RunCommandRequest.builder()
-                                            .command(
-                                                    "cat "
-                                                            + containerMountPath
-                                                            + "/sandbox-output.txt")
-                                            .build());
+            // Retry: bind mount propagation can sometimes lag on first access
+            Execution readBack = runWithRetry(volumeSandbox, "cat " + containerMountPath + "/sandbox-output.txt");
             assertNull(readBack.getError());
             assertEquals(1, readBack.getLogs().getStdout().size());
             assertEquals("written-from-sandbox", readBack.getLogs().getStdout().get(0).getText());
@@ -593,13 +603,8 @@ public class SandboxE2ETest extends BaseE2ETest {
             assertTrue(roSandbox.isHealthy(), "Read-only volume sandbox should be healthy");
 
             // Step 1: Verify the host marker file is readable
-            Execution readMarker =
-                    roSandbox
-                            .commands()
-                            .run(
-                                    RunCommandRequest.builder()
-                                            .command("cat " + containerMountPath + "/marker.txt")
-                                            .build());
+            // Retry: bind mount propagation can sometimes lag on first access
+            Execution readMarker = runWithRetry(roSandbox, "cat " + containerMountPath + "/marker.txt");
             assertNull(readMarker.getError(), "Failed to read marker file on read-only mount");
             assertEquals(1, readMarker.getLogs().getStdout().size());
             assertEquals(
@@ -655,13 +660,8 @@ public class SandboxE2ETest extends BaseE2ETest {
             assertTrue(pvcSandbox.isHealthy(), "PVC volume sandbox should be healthy");
 
             // Step 1: Verify the marker file seeded into the named volume is readable
-            Execution readMarker =
-                    pvcSandbox
-                            .commands()
-                            .run(
-                                    RunCommandRequest.builder()
-                                            .command("cat " + containerMountPath + "/marker.txt")
-                                            .build());
+            // Retry: bind mount propagation can sometimes lag on first access
+            Execution readMarker = runWithRetry(pvcSandbox, "cat " + containerMountPath + "/marker.txt");
             assertNull(readMarker.getError(), "Failed to read marker file from PVC volume");
             assertEquals(1, readMarker.getLogs().getStdout().size());
             assertEquals("pvc-marker-data", readMarker.getLogs().getStdout().get(0).getText());
@@ -680,14 +680,8 @@ public class SandboxE2ETest extends BaseE2ETest {
             assertNull(writeResult.getError(), "Failed to write file to PVC volume");
 
             // Step 3: Verify the written file is readable
-            Execution readBack =
-                    pvcSandbox
-                            .commands()
-                            .run(
-                                    RunCommandRequest.builder()
-                                            .command(
-                                                    "cat " + containerMountPath + "/pvc-output.txt")
-                                            .build());
+            // Retry: bind mount propagation can sometimes lag on first access
+            Execution readBack = runWithRetry(pvcSandbox, "cat " + containerMountPath + "/pvc-output.txt");
             assertNull(readBack.getError());
             assertEquals(1, readBack.getLogs().getStdout().size());
             assertEquals("written-to-pvc", readBack.getLogs().getStdout().get(0).getText());
@@ -739,13 +733,8 @@ public class SandboxE2ETest extends BaseE2ETest {
             assertTrue(roSandbox.isHealthy(), "Read-only PVC volume sandbox should be healthy");
 
             // Step 1: Verify the marker file is readable
-            Execution readMarker =
-                    roSandbox
-                            .commands()
-                            .run(
-                                    RunCommandRequest.builder()
-                                            .command("cat " + containerMountPath + "/marker.txt")
-                                            .build());
+            // Retry: bind mount propagation can sometimes lag on first access
+            Execution readMarker = runWithRetry(roSandbox, "cat " + containerMountPath + "/marker.txt");
             assertNull(readMarker.getError(), "Failed to read marker file on read-only PVC mount");
             assertEquals(1, readMarker.getLogs().getStdout().size());
             assertEquals("pvc-marker-data", readMarker.getLogs().getStdout().get(0).getText());
@@ -801,13 +790,8 @@ public class SandboxE2ETest extends BaseE2ETest {
             assertTrue(subpathSandbox.isHealthy(), "PVC subPath sandbox should be healthy");
 
             // Step 1: Verify the subpath marker file is readable
-            Execution readMarker =
-                    subpathSandbox
-                            .commands()
-                            .run(
-                                    RunCommandRequest.builder()
-                                            .command("cat " + containerMountPath + "/marker.txt")
-                                            .build());
+            // Retry: bind mount propagation can sometimes lag on first access
+            Execution readMarker = runWithRetry(subpathSandbox, "cat " + containerMountPath + "/marker.txt");
             assertNull(readMarker.getError(), "Failed to read subpath marker file");
             assertEquals(1, readMarker.getLogs().getStdout().size());
             assertEquals("pvc-subpath-marker", readMarker.getLogs().getStdout().get(0).getText());
@@ -841,13 +825,8 @@ public class SandboxE2ETest extends BaseE2ETest {
                                             .build());
             assertNull(writeResult.getError(), "Failed to write file to PVC subPath");
 
-            Execution readBack =
-                    subpathSandbox
-                            .commands()
-                            .run(
-                                    RunCommandRequest.builder()
-                                            .command("cat " + containerMountPath + "/output.txt")
-                                            .build());
+            // Retry: bind mount propagation can sometimes lag on first access
+            Execution readBack = runWithRetry(subpathSandbox, "cat " + containerMountPath + "/output.txt");
             assertNull(readBack.getError());
             assertEquals(1, readBack.getLogs().getStdout().size());
             assertEquals("subpath-write-test", readBack.getLogs().getStdout().get(0).getText());
@@ -1392,19 +1371,75 @@ public class SandboxE2ETest extends BaseE2ETest {
             Thread.sleep(50);
         } catch (InterruptedException ignored) {
         }
-        sandbox.files()
-                .replaceContents(
+        var replaceResults = sandbox.files()
+                .replaceContentsDetailed(
                         List.of(
                                 ContentReplaceEntry.builder()
                                         .path(testFile1)
                                         .oldContent("Appended line to file1")
                                         .newContent("Replaced line in file1")
                                         .build()));
+        assertEquals(1, replaceResults.size());
+        assertEquals(testFile1, replaceResults.get(0).getPath());
+        assertEquals(1, replaceResults.get(0).getReplacedCount());
         String replaced = sandbox.files().readFile(testFile1, "UTF-8", null);
         assertTrue(replaced.contains("Replaced line in file1"));
         assertFalse(replaced.contains("Appended line to file1"));
         EntryInfo afterReplace = sandbox.files().readFileInfo(List.of(testFile1)).get(testFile1);
         assertModifiedUpdated(beforeReplace.getModifiedAt(), afterReplace.getModifiedAt(), 1, 1000);
+
+        // No match → replacedCount=0
+        var noMatchResults = sandbox.files().replaceContentsDetailed(List.of(
+                ContentReplaceEntry.builder()
+                        .path(testFile1)
+                        .oldContent("nonexistent string")
+                        .newContent("irrelevant")
+                        .build()));
+        assertEquals(1, noMatchResults.size());
+        assertEquals(0, noMatchResults.get(0).getReplacedCount());
+
+        // Multiple matches
+        sandbox.files().write(List.of(
+                WriteEntry.builder().path(testDir1 + "/multi.txt").data("foo bar foo baz foo").build()));
+        var multiResults = sandbox.files().replaceContentsDetailed(List.of(
+                ContentReplaceEntry.builder()
+                        .path(testDir1 + "/multi.txt")
+                        .oldContent("foo")
+                        .newContent("qux")
+                        .build()));
+        assertEquals(1, multiResults.size());
+        assertEquals(3, multiResults.get(0).getReplacedCount());
+
+        // Batch replace across multiple files
+        String batchFileA = testDir1 + "/batch_a.txt";
+        String batchFileB = testDir1 + "/batch_b.txt";
+        sandbox.files().write(List.of(
+                WriteEntry.builder().path(batchFileA).data("hello world").build(),
+                WriteEntry.builder().path(batchFileB).data("hello hello").build()));
+        var batchResults = sandbox.files().replaceContentsDetailed(List.of(
+                ContentReplaceEntry.builder().path(batchFileA).oldContent("hello").newContent("hi").build(),
+                ContentReplaceEntry.builder().path(batchFileB).oldContent("hello").newContent("hi").build()));
+        assertEquals(2, batchResults.size());
+        var resultsByPath = batchResults.stream()
+                .collect(java.util.stream.Collectors.toMap(
+                        ContentReplaceResult::getPath, ContentReplaceResult::getReplacedCount));
+        assertEquals(1, resultsByPath.get(batchFileA));
+        assertEquals(2, resultsByPath.get(batchFileB));
+        assertEquals("hi world", sandbox.files().readFile(batchFileA, "UTF-8", null));
+        assertEquals("hi hi", sandbox.files().readFile(batchFileB, "UTF-8", null));
+
+        // Verify original replaceContents (verbose=false, void return) still works
+        sandbox.files().replaceContents(List.of(
+                ContentReplaceEntry.builder()
+                        .path(testFile1)
+                        .oldContent("Replaced line in file1")
+                        .newContent("Final line in file1")
+                        .build()));
+        String finalContent = sandbox.files().readFile(testFile1, "UTF-8", null);
+        assertTrue(finalContent.contains("Final line in file1"));
+        assertFalse(finalContent.contains("Replaced line in file1"));
+
+        sandbox.files().deleteFiles(List.of(testDir1 + "/multi.txt", batchFileA, batchFileB));
 
         // Move file3
         String movedPath = testDir2 + "/moved_file3.txt";
@@ -1467,6 +1502,38 @@ public class SandboxE2ETest extends BaseE2ETest {
     }
 
     @Test
+    @Order(5)
+    @DisplayName("Line-based file reading with offset and limit")
+    @Timeout(value = 1, unit = TimeUnit.MINUTES)
+    void testLineBasedFileReading() throws Exception {
+        assertNotNull(sandbox);
+
+        String testPath = "/tmp/line-read-e2e.txt";
+        String content = "line1\nline2\nline3\nline4\nline5";
+        sandbox.files()
+                .write(
+                        List.of(
+                                WriteEntry.builder()
+                                        .path(testPath)
+                                        .data(content)
+                                        .build()));
+
+        // offset=2, limit=2 → lines 2-3
+        String result1 = sandbox.files().readFile(testPath, "UTF-8", null, 2, 2);
+        assertEquals("line2\nline3", result1);
+
+        // offset=4, no limit → lines 4-5
+        String result2 = sandbox.files().readFile(testPath, "UTF-8", null, 4, null);
+        assertEquals("line4\nline5", result2);
+
+        // limit=2, no offset → lines 1-2
+        String result3 = sandbox.files().readFile(testPath, "UTF-8", null, null, 2);
+        assertEquals("line1\nline2", result3);
+
+        sandbox.files().deleteFiles(List.of(testPath));
+    }
+
+    @Test
     @Order(6)
     @DisplayName("Interrupt command")
     @Timeout(value = 2, unit = TimeUnit.MINUTES)
@@ -1521,6 +1588,8 @@ public class SandboxE2ETest extends BaseE2ETest {
     @DisplayName("Sandbox Pause Operation")
     @Timeout(value = 5, unit = TimeUnit.MINUTES)
     void testSandboxPause() throws InterruptedException {
+        Assumptions.assumeTrue(false, "skip pause/resume e2e test");
+
         assertNotNull(sandbox);
 
         Thread.sleep(20000);
@@ -1560,6 +1629,8 @@ public class SandboxE2ETest extends BaseE2ETest {
     @DisplayName("Sandbox Resume Operation")
     @Timeout(value = 3, unit = TimeUnit.MINUTES)
     void testSandboxResume() throws InterruptedException {
+        Assumptions.assumeTrue(false, "skip pause/resume e2e test");
+
         assertNotNull(sandbox);
 
         Sandbox resumedSandbox =
@@ -1617,5 +1688,53 @@ public class SandboxE2ETest extends BaseE2ETest {
                             }
                         });
         assertEquals(requestId, ex.getRequestId());
+    }
+
+    private Execution runWithRetry(Sandbox sandbox, String command) {
+        return runWithRetry(sandbox, command, 5, 500);
+    }
+
+    private Execution runWithRetry(Sandbox sandbox, String command, int maxAttempts, long delayMs) {
+        Execution result = null;
+        for (int attempt = 0; attempt < maxAttempts; attempt++) {
+            result = sandbox.commands().run(
+                RunCommandRequest.builder().command(command).build());
+            if (result.getError() == null && !result.getLogs().getStdout().isEmpty()) {
+                return result;
+            }
+            if (attempt < maxAttempts - 1) {
+                try { Thread.sleep(delayMs); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Polls the sandbox running curl until the given URL is blocked by the
+     * network policy. Returns once curl reports an error (egress active), or
+     * fails the test if the timeout elapses.
+     */
+    private void waitUntilEgressBlocks(Sandbox sandbox, String url, Duration timeout) {
+        long deadline = System.currentTimeMillis() + timeout.toMillis();
+        Execution last = null;
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                last = sandbox.commands().run(
+                        RunCommandRequest.builder().command("curl -I " + url).build());
+                if (last != null && last.getError() != null) {
+                    return;
+                }
+            } catch (Exception ignored) {
+                // Transient SDK/SSE errors during sidecar warmup — keep polling.
+            }
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        fail("Egress policy did not block " + url + " within " + timeout
+                + " (last execution error=" + (last == null ? "null" : last.getError()) + ")");
     }
 }

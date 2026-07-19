@@ -18,6 +18,8 @@ package com.alibaba.opensandbox.sandbox.infrastructure.adapters.service
 
 import com.alibaba.opensandbox.sandbox.HttpClientProvider
 import com.alibaba.opensandbox.sandbox.config.ConnectionConfig
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxApiException
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialProxyConfig
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkPolicy
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkRule
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.OSSFS
@@ -25,8 +27,10 @@ import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PlatformSpec
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxFilter
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxImageSpec
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxState
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotFilter
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.Volume
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -35,6 +39,7 @@ import okhttp3.mockwebserver.MockWebServer
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -114,6 +119,8 @@ class SandboxesAdapterTest {
                 extensions = extensions,
                 volumes = null,
                 secureAccess = true,
+                snapshotId = null,
+                credentialProxy = CredentialProxyConfig.enabled(),
             )
 
         // Verify request
@@ -142,6 +149,9 @@ class SandboxesAdapterTest {
         assertNotNull(gotPlatform, "platform should be present in createSandbox request")
         assertEquals("linux", gotPlatform!!["os"]!!.jsonPrimitive.content)
         assertEquals("arm64", gotPlatform["arch"]!!.jsonPrimitive.content)
+        val gotCredentialProxy = payload["credentialProxy"]?.jsonObject
+        assertNotNull(gotCredentialProxy, "credentialProxy should be present in createSandbox request")
+        assertEquals("true", gotCredentialProxy!!["enabled"]!!.jsonPrimitive.content)
         assertEquals("true", payload["secureAccess"]!!.jsonPrimitive.content)
 
         // Verify response
@@ -182,6 +192,7 @@ class SandboxesAdapterTest {
                 extensions = emptyMap(),
                 volumes = null,
                 secureAccess = false,
+                credentialProxy = null,
             )
 
         val request = mockWebServer.takeRequest()
@@ -220,6 +231,9 @@ class SandboxesAdapterTest {
                 networkPolicy = null,
                 extensions = emptyMap(),
                 volumes = null,
+                secureAccess = false,
+                snapshotId = null,
+                credentialProxy = null,
             )
 
         assertEquals("manual-sbx", result.id)
@@ -227,6 +241,235 @@ class SandboxesAdapterTest {
         val request = mockWebServer.takeRequest()
         val payload = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
         assertEquals("false", payload["secureAccess"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `createSandbox should support snapshot restore request`() {
+        val responseBody =
+            """
+            {
+                "id": "snapshot-sbx",
+                "status": { "state": "Running" },
+                "createdAt": "2023-01-01T10:00:00Z",
+                "entrypoint": ["bash"]
+            }
+            """.trimIndent()
+        mockWebServer.enqueue(MockResponse().setBody(responseBody).setResponseCode(201))
+
+        sandboxesAdapter.createSandbox(
+            spec = null,
+            entrypoint = null,
+            env = emptyMap(),
+            metadata = emptyMap(),
+            timeout = null,
+            resource = mapOf("cpu" to "1"),
+            platform = null,
+            networkPolicy = null,
+            extensions = emptyMap(),
+            volumes = null,
+            secureAccess = false,
+            snapshotId = "snap-123",
+            credentialProxy = null,
+        )
+
+        val request = mockWebServer.takeRequest()
+        val payload = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+        assertEquals("snap-123", payload["snapshotId"]!!.jsonPrimitive.content)
+        assertEquals(JsonNull, payload["image"])
+        assertEquals(JsonNull, payload["entrypoint"])
+    }
+
+    @Test
+    fun `createSandbox should preserve explicit snapshot entrypoint`() {
+        mockWebServer.enqueue(
+            MockResponse()
+                .setBody(
+                    """
+                    {
+                      "id": "sbx-123",
+                      "status": { "state": "Pending" },
+                      "metadata": {},
+                      "createdAt": "2025-01-01T00:00:00Z",
+                      "entrypoint": ["python", "app.py"]
+                    }
+                    """.trimIndent(),
+                ).setResponseCode(202),
+        )
+
+        sandboxesAdapter.createSandbox(
+            spec = null,
+            entrypoint = listOf("python", "app.py"),
+            env = emptyMap(),
+            metadata = emptyMap(),
+            timeout = null,
+            resource = mapOf("cpu" to "1"),
+            platform = null,
+            networkPolicy = null,
+            extensions = emptyMap(),
+            volumes = null,
+            secureAccess = false,
+            snapshotId = "snap-123",
+            credentialProxy = null,
+        )
+
+        val request = mockWebServer.takeRequest()
+        val payload = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+        assertEquals("snap-123", payload["snapshotId"]!!.jsonPrimitive.content)
+        assertEquals(
+            Json.parseToJsonElement("""["python","app.py"]"""),
+            payload["entrypoint"],
+        )
+    }
+
+    @Test
+    fun `createSnapshot should send request to snapshots api and parse response`() {
+        val sandboxId = "sandbox-123"
+        val responseBody =
+            """
+            {
+                "id": "snap-123",
+                "sandboxId": "$sandboxId",
+                "name": "baseline",
+                "status": {
+                    "state": "Ready",
+                    "reason": "snapshot_ready",
+                    "message": null,
+                    "lastTransitionAt": "2023-01-01T10:00:00Z"
+                },
+                "createdAt": "2023-01-01T10:00:00Z"
+            }
+            """.trimIndent()
+        mockWebServer.enqueue(MockResponse().setBody(responseBody).setResponseCode(201))
+
+        val result = sandboxesAdapter.createSnapshot(sandboxId, "baseline")
+
+        assertEquals("snap-123", result.id)
+        assertEquals(sandboxId, result.sandboxId)
+        assertEquals("baseline", result.name)
+
+        val request = mockWebServer.takeRequest()
+        assertEquals("POST", request.method)
+        assertEquals("/v1/sandboxes/$sandboxId/snapshots", request.path)
+        val payload = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+        assertEquals("baseline", payload["name"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `getSnapshot should send request to snapshots api and parse response`() {
+        val snapshotId = "snap-123"
+        val responseBody =
+            """
+            {
+                "id": "$snapshotId",
+                "sandboxId": "sandbox-123",
+                "name": "baseline",
+                "status": {
+                    "state": "Ready",
+                    "reason": "snapshot_ready",
+                    "message": null,
+                    "lastTransitionAt": "2023-01-01T10:00:00Z"
+                },
+                "createdAt": "2023-01-01T10:00:00Z"
+            }
+            """.trimIndent()
+        mockWebServer.enqueue(MockResponse().setBody(responseBody).setResponseCode(200))
+
+        val result = sandboxesAdapter.getSnapshot(snapshotId)
+
+        assertEquals(snapshotId, result.id)
+        assertEquals("sandbox-123", result.sandboxId)
+
+        val request = mockWebServer.takeRequest()
+        assertEquals("GET", request.method)
+        assertEquals("/v1/snapshots/$snapshotId", request.path)
+    }
+
+    @Test
+    fun `listSnapshots should send request to snapshots api with filters`() {
+        val responseBody =
+            """
+            {
+                "items": [
+                    {
+                        "id": "snap-123",
+                        "sandboxId": "sandbox-123",
+                        "name": "baseline",
+                        "status": {
+                            "state": "Ready",
+                            "reason": "snapshot_ready",
+                            "message": null,
+                            "lastTransitionAt": "2023-01-01T10:00:00Z"
+                        },
+                        "createdAt": "2023-01-01T10:00:00Z"
+                    }
+                ],
+                "pagination": {
+                    "page": 1,
+                    "pageSize": 20,
+                    "totalItems": 1,
+                    "totalPages": 1,
+                    "hasNextPage": false
+                }
+            }
+            """.trimIndent()
+        mockWebServer.enqueue(MockResponse().setBody(responseBody).setResponseCode(200))
+
+        val filter =
+            SnapshotFilter.builder()
+                .sandboxId("sandbox-123")
+                .states("ready", "pending")
+                .page(1)
+                .pageSize(20)
+                .build()
+
+        val result = sandboxesAdapter.listSnapshots(filter)
+
+        assertEquals(1, result.snapshotInfos.size)
+        assertEquals("snap-123", result.snapshotInfos.first().id)
+
+        val request = mockWebServer.takeRequest()
+        assertEquals("GET", request.method)
+        val url = request.requestUrl
+        assertNotNull(url)
+        assertEquals("sandbox-123", url!!.queryParameter("sandboxId"))
+        assertEquals(listOf("ready", "pending"), url.queryParameterValues("state"))
+        assertEquals("1", url.queryParameter("page"))
+        assertEquals("20", url.queryParameter("pageSize"))
+    }
+
+    @Test
+    fun `deleteSnapshot should send request to snapshots api`() {
+        val snapshotId = "snap-123"
+        mockWebServer.enqueue(MockResponse().setResponseCode(204))
+
+        sandboxesAdapter.deleteSnapshot(snapshotId)
+
+        val request = mockWebServer.takeRequest()
+        assertEquals("DELETE", request.method)
+        assertEquals("/v1/snapshots/$snapshotId", request.path)
+    }
+
+    @Test
+    fun `deleteSnapshot should convert conflict response into sandbox api exception`() {
+        val snapshotId = "snap-123"
+        mockWebServer.enqueue(
+            MockResponse()
+                .setResponseCode(409)
+                .setBody("""{"code":"SNAPSHOT::IN_USE","message":"image is being used by running container"}"""),
+        )
+
+        val ex =
+            assertThrows(SandboxApiException::class.java) {
+                sandboxesAdapter.deleteSnapshot(snapshotId)
+            }
+
+        assertEquals(409, ex.statusCode)
+        assertEquals("SNAPSHOT::IN_USE", ex.error.code)
+        assertEquals("image is being used by running container", ex.error.message)
+
+        val request = mockWebServer.takeRequest()
+        assertEquals("DELETE", request.method)
+        assertEquals("/v1/snapshots/$snapshotId", request.path)
     }
 
     @Test
@@ -273,6 +516,9 @@ class SandboxesAdapterTest {
             networkPolicy = null,
             extensions = emptyMap(),
             volumes = volumes,
+            secureAccess = false,
+            snapshotId = null,
+            credentialProxy = null,
         )
 
         val request = mockWebServer.takeRequest()
@@ -307,7 +553,10 @@ class SandboxesAdapterTest {
                 "image": {
                     "uri": "ubuntu:latest"
                 },
-                "metadata": {}
+                "metadata": {},
+                "extensions": {
+                    "opensandbox.extensions.custom-label": "中文数据"
+                }
             }
             """.trimIndent()
 
@@ -317,7 +566,8 @@ class SandboxesAdapterTest {
 
         assertEquals(sandboxId, result.id)
         assertEquals(SandboxState.RUNNING, result.status.state)
-        assertEquals("ubuntu:latest", result.image.image)
+        assertEquals("ubuntu:latest", result.image!!.image)
+        assertEquals("中文数据", result.extensions!!["opensandbox.extensions.custom-label"])
 
         val request = mockWebServer.takeRequest()
         assertEquals("/v1/sandboxes/$sandboxId", request.path)
@@ -352,6 +602,42 @@ class SandboxesAdapterTest {
 
         assertEquals(sandboxId, result.id)
         assertEquals(null, result.expiresAt)
+    }
+
+    @Test
+    fun `patchSandboxMetadata should preserve null values for delete semantics`() {
+        val sandboxId = "sandbox-id"
+        val responseBody =
+            """
+            {
+                "id": "$sandboxId",
+                "status": { "state": "Running" },
+                "entrypoint": ["/bin/bash"],
+                "expiresAt": null,
+                "createdAt": "2023-01-01T10:00:00Z",
+                "metadata": {
+                    "env": "production"
+                }
+            }
+            """.trimIndent()
+
+        mockWebServer.enqueue(MockResponse().setBody(responseBody).setResponseCode(200))
+
+        val result =
+            sandboxesAdapter.patchSandboxMetadata(
+                sandboxId,
+                mapOf("team" to null, "env" to "production"),
+            )
+
+        assertEquals(sandboxId, result.id)
+        assertEquals("production", result.metadata?.get("env"))
+
+        val request = mockWebServer.takeRequest()
+        assertEquals("PATCH", request.method)
+        assertEquals("/v1/sandboxes/$sandboxId/metadata", request.path)
+        val payload = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+        assertEquals(JsonNull, payload["team"])
+        assertEquals("production", payload["env"]!!.jsonPrimitive.content)
     }
 
     @Test

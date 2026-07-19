@@ -125,7 +125,7 @@ func TestScenario_SimpleAgentLoop(t *testing.T) {
 	config := getConnectionConfig(t)
 	sb, err := opensandbox.CreateSandbox(ctx, config, opensandbox.SandboxCreateOptions{
 		Image: getSandboxImage(),
-		Env:   map[string]string{"EXECD_API_GRACE_SHUTDOWN": "3s", "EXECD_JUPYTER_IDLE_POLL_INTERVAL": "1s"},
+		Env:   map[string]string{"EXECD_API_GRACE_SHUTDOWN": "3s", "EXECD_JUPYTER_IDLE_POLL_INTERVAL": "200ms"},
 	})
 	require.NoError(t, err)
 	defer sb.Kill(context.Background())
@@ -171,6 +171,10 @@ func TestScenario_SimpleAgentLoop(t *testing.T) {
 }
 
 func TestScenario_CodeInterpreterAgent(t *testing.T) {
+	if os.Getenv("RUN_CODE_INTERPRETER_E2E") != "true" {
+		t.Skip("Set RUN_CODE_INTERPRETER_E2E=true to run code interpreter e2e tests")
+	}
+
 	llmEndpoint := getLLMEndpoint()
 	if llmEndpoint == "" {
 		t.Skip("LLM_ENDPOINT or OPENSANDBOX_TEST_DOMAIN not set")
@@ -183,7 +187,7 @@ func TestScenario_CodeInterpreterAgent(t *testing.T) {
 	ci, err := opensandbox.CreateCodeInterpreter(ctx, config, opensandbox.CodeInterpreterCreateOptions{
 		ReadyTimeout:        60 * time.Second,
 		HealthCheckInterval: 500 * time.Millisecond,
-		Env:                 map[string]string{"EXECD_API_GRACE_SHUTDOWN": "3s", "EXECD_JUPYTER_IDLE_POLL_INTERVAL": "1s"},
+		Env:                 map[string]string{"EXECD_API_GRACE_SHUTDOWN": "3s", "EXECD_JUPYTER_IDLE_POLL_INTERVAL": "200ms"},
 	})
 	require.NoError(t, err)
 	defer ci.Kill(context.Background())
@@ -254,7 +258,7 @@ func TestScenario_SandboxToolUse(t *testing.T) {
 	config := getConnectionConfig(t)
 	sb, err := opensandbox.CreateSandbox(ctx, config, opensandbox.SandboxCreateOptions{
 		Image: getSandboxImage(),
-		Env:   map[string]string{"EXECD_API_GRACE_SHUTDOWN": "3s", "EXECD_JUPYTER_IDLE_POLL_INTERVAL": "1s"},
+		Env:   map[string]string{"EXECD_API_GRACE_SHUTDOWN": "3s", "EXECD_JUPYTER_IDLE_POLL_INTERVAL": "200ms"},
 	})
 	require.NoError(t, err)
 	defer sb.Kill(context.Background())

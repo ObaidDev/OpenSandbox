@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/alibaba/opensandbox/execd/pkg/jupyter/execute"
@@ -43,7 +44,7 @@ func (c *Controller) runCommand(ctx context.Context, request *ExecuteCodeRequest
 	}
 
 	startAt := time.Now()
-	log.Info("received command: %v", request.Code)
+	log.Info("received command: %v", log.SanitizeCommand(request.Code))
 	cmd := exec.CommandContext(ctx, "cmd", "/C", request.Code)
 	extraEnv := mergeExtraEnvs(loadExtraEnvFromFile(), request.Envs)
 	cwd, err := pathutil.ExpandPathWithEnv(request.Cwd, extraEnv)
@@ -57,15 +58,21 @@ func (c *Controller) runCommand(ctx context.Context, request *ExecuteCodeRequest
 	cmd.Env = mergeEnvs(os.Environ(), extraEnv)
 
 	done := make(chan struct{}, 1)
+	var wg sync.WaitGroup
+	wg.Add(2)
 	safego.Go(func() {
+		defer wg.Done()
 		c.tailStdPipe(c.stdoutFileName(session), request.Hooks.OnExecuteStdout, done)
 	})
 	safego.Go(func() {
+		defer wg.Done()
 		c.tailStdPipe(c.stderrFileName(session), request.Hooks.OnExecuteStderr, done)
 	})
 
 	err = cmd.Start()
 	if err != nil {
+		close(done)
+		wg.Wait()
 		request.Hooks.OnExecuteError(&execute.ErrorOutput{EName: "CommandExecError", EValue: err.Error()})
 		log.Error("CommandExecError: error starting commands: %v", err)
 		return nil
@@ -80,6 +87,7 @@ func (c *Controller) runCommand(ctx context.Context, request *ExecuteCodeRequest
 
 	err = cmd.Wait()
 	close(done)
+	wg.Wait()
 	if err != nil {
 		var eName, eValue string
 		var traceback []string
@@ -121,7 +129,7 @@ func (c *Controller) runBackgroundCommand(ctx context.Context, cancel context.Ca
 	stderrPath := c.combinedOutputFileName(session)
 
 	startAt := time.Now()
-	log.Info("received command: %v", request.Code)
+	log.Info("received command: %v", log.SanitizeCommand(request.Code))
 	cmd := exec.CommandContext(ctx, "cmd", "/C", request.Code)
 	extraEnv := mergeExtraEnvs(loadExtraEnvFromFile(), request.Envs)
 	cwd, err := pathutil.ExpandPathWithEnv(request.Cwd, extraEnv)
@@ -137,34 +145,37 @@ func (c *Controller) runBackgroundCommand(ctx context.Context, cancel context.Ca
 	devNull, _ := os.OpenFile(os.DevNull, os.O_RDWR, 0) // best-effort, ignore error
 	cmd.Stdin = devNull
 
+	// Start the process synchronously so that the command kernel can be
+	// registered before Execute returns. This lets GetCommandStatus
+	// callers find the session immediately.
+	err = cmd.Start()
+	if err != nil {
+		log.Error("CommandExecError: error starting commands: %v", err)
+		pipe.Close() // best-effort
+		cancel()
+		return fmt.Errorf("failed to start commands: %w", err)
+	}
+
+	kernel := &commandKernel{
+		pid:          cmd.Process.Pid,
+		content:      request.Code,
+		stdoutPath:   stdoutPath,
+		stderrPath:   stderrPath,
+		startedAt:    startAt,
+		running:      true,
+		isBackground: true,
+	}
+	c.storeCommandKernel(session, kernel)
+
 	safego.Go(func() {
-		err := cmd.Start()
-		if err != nil {
-			log.Error("CommandExecError: error starting commands: %v", err)
-			pipe.Close() // best-effort
-			cancel()
-			return
+		<-ctx.Done()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill() // best-effort
 		}
+	})
 
-		kernel := &commandKernel{
-			pid:          cmd.Process.Pid,
-			content:      request.Code,
-			stdoutPath:   stdoutPath,
-			stderrPath:   stderrPath,
-			startedAt:    startAt,
-			running:      true,
-			isBackground: true,
-		}
-		c.storeCommandKernel(session, kernel)
-
-		safego.Go(func() {
-			<-ctx.Done()
-			if cmd.Process != nil {
-				_ = cmd.Process.Kill() // best-effort
-			}
-		})
-
-		err = cmd.Wait()
+	safego.Go(func() {
+		err := cmd.Wait()
 		cancel()
 		pipe.Close()    // best-effort
 		devNull.Close() // best-effort

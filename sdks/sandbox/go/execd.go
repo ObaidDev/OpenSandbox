@@ -21,6 +21,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"os"
 	"strconv"
@@ -50,7 +51,9 @@ func (e *ExecdClient) Ping(ctx context.Context) error {
 // ListContexts returns all active code execution contexts for the given language.
 func (e *ExecdClient) ListContexts(ctx context.Context, language string) ([]CodeContext, error) {
 	var result []CodeContext
-	path := "/code/contexts?language=" + url.QueryEscape(language)
+	params := url.Values{}
+	params.Set("language", language)
+	path := "/code/contexts?" + params.Encode()
 	err := e.client.doRequest(ctx, http.MethodGet, path, nil, &result)
 	return result, err
 }
@@ -84,7 +87,9 @@ func (e *ExecdClient) DeleteContext(ctx context.Context, contextID string) error
 
 // DeleteContextsByLanguage deletes all code execution contexts for the given language.
 func (e *ExecdClient) DeleteContextsByLanguage(ctx context.Context, language string) error {
-	path := "/code/contexts?language=" + url.QueryEscape(language)
+	params := url.Values{}
+	params.Set("language", language)
+	path := "/code/contexts?" + params.Encode()
 	return e.client.doRequest(ctx, http.MethodDelete, path, nil, nil)
 }
 
@@ -96,7 +101,9 @@ func (e *ExecdClient) ExecuteCode(ctx context.Context, req RunCodeRequest, handl
 
 // InterruptCode interrupts the currently running code execution.
 func (e *ExecdClient) InterruptCode(ctx context.Context, sessionID string) error {
-	path := "/code?id=" + url.QueryEscape(sessionID)
+	params := url.Values{}
+	params.Set("id", sessionID)
+	path := "/code?" + params.Encode()
 	return e.client.doRequest(ctx, http.MethodDelete, path, nil, nil)
 }
 
@@ -130,7 +137,9 @@ func (e *ExecdClient) RunCommand(ctx context.Context, req RunCommandRequest, han
 
 // InterruptCommand interrupts the currently running command execution.
 func (e *ExecdClient) InterruptCommand(ctx context.Context, sessionID string) error {
-	path := "/command?id=" + url.QueryEscape(sessionID)
+	params := url.Values{}
+	params.Set("id", sessionID)
+	path := "/command?" + params.Encode()
 	return e.client.doRequest(ctx, http.MethodDelete, path, nil, nil)
 }
 
@@ -160,6 +169,7 @@ func (e *ExecdClient) GetCommandLogs(ctx context.Context, commandID string, curs
 		if err != nil {
 			return fmt.Errorf("opensandbox: create request: %w", err)
 		}
+		req.Header.Set("User-Agent", "OpenSandbox-Go-SDK/"+Version)
 		for k, v := range e.client.headers {
 			req.Header.Set(k, v)
 		}
@@ -205,7 +215,9 @@ func (e *ExecdClient) GetCommandLogs(ctx context.Context, commandID string, curs
 // GetFileInfo retrieves metadata for the file at the given path.
 func (e *ExecdClient) GetFileInfo(ctx context.Context, path string) (map[string]FileInfo, error) {
 	var result map[string]FileInfo
-	reqPath := "/files/info?path=" + url.QueryEscape(path)
+	params := url.Values{}
+	params.Set("path", path)
+	reqPath := "/files/info?" + params.Encode()
 	err := e.client.doRequest(ctx, http.MethodGet, reqPath, nil, &result)
 	return result, err
 }
@@ -243,23 +255,75 @@ func (e *ExecdClient) SearchFiles(ctx context.Context, dir string, pattern strin
 	return result, err
 }
 
+// ListDirectory lists the immediate children of the given directory using the
+// server-side default depth (1). Use ListDirectoryWithDepth to override.
+func (e *ExecdClient) ListDirectory(ctx context.Context, path string) ([]FileInfo, error) {
+	return e.listDirectory(ctx, path, nil)
+}
+
+// ListDirectoryWithDepth lists directory contents up to the given depth.
+// depth=0 returns an empty slice (the directory itself is not listed).
+// depth=1 returns the immediate children. Larger values include descendants
+// up to that many levels below path. Negative values are rejected by the
+// server.
+func (e *ExecdClient) ListDirectoryWithDepth(ctx context.Context, path string, depth int) ([]FileInfo, error) {
+	d := depth
+	return e.listDirectory(ctx, path, &d)
+}
+
+func (e *ExecdClient) listDirectory(ctx context.Context, path string, depth *int) ([]FileInfo, error) {
+	var result []FileInfo
+	params := url.Values{}
+	params.Set("path", path)
+	if depth != nil {
+		params.Set("depth", strconv.Itoa(*depth))
+	}
+	reqPath := "/directories/list?" + params.Encode()
+	err := e.client.doRequest(ctx, http.MethodGet, reqPath, nil, &result)
+	return result, err
+}
+
 // ReplaceInFiles performs text replacement in the specified files.
 func (e *ExecdClient) ReplaceInFiles(ctx context.Context, req ReplaceRequest) error {
 	return e.client.doRequest(ctx, http.MethodPost, "/files/replace", req, nil)
 }
 
+// ReplaceInFilesDetailed performs text replacement and returns per-file replacement counts.
+func (e *ExecdClient) ReplaceInFilesDetailed(ctx context.Context, req ReplaceRequest) (ReplaceResponse, error) {
+	var resp ReplaceResponse
+	err := e.client.doRequest(ctx, http.MethodPost, "/files/replace?verbose=true", req, &resp)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// UploadFileOptions configures the destination path and multipart filename for an upload.
 type UploadFileOptions struct {
 	FileName string
 	Metadata FileMetadata
 }
 
+// UploadFileEntry describes one file part in a multi-file upload request.
+type UploadFileEntry struct {
+	File    io.Reader
+	Options UploadFileOptions
+}
+
+// UploadFile uploads a single file to the sandbox.
 func (e *ExecdClient) UploadFile(ctx context.Context, file io.Reader, opts UploadFileOptions) error {
-	req, bodyCloser, err := e.newUploadRequest(ctx, file, opts)
+	return e.UploadFiles(ctx, []UploadFileEntry{{File: file, Options: opts}})
+}
+
+// UploadFiles uploads one or more files to the sandbox in a single multipart request.
+func (e *ExecdClient) UploadFiles(ctx context.Context, entries []UploadFileEntry) error {
+	req, bodyCloser, err := e.newUploadFilesRequest(ctx, entries)
 	if err != nil {
 		return err
 	}
 	defer bodyCloser.Close()
 
+	req.Header.Set("User-Agent", "OpenSandbox-Go-SDK/"+Version)
 	for k, v := range e.client.headers {
 		req.Header.Set(k, v)
 	}
@@ -278,16 +342,17 @@ func (e *ExecdClient) UploadFile(ctx context.Context, file io.Reader, opts Uploa
 	return nil
 }
 
-func (e *ExecdClient) newUploadRequest(ctx context.Context, file io.Reader, opts UploadFileOptions) (*http.Request, io.Closer, error) {
-	if file == nil {
-		return nil, nil, &InvalidArgumentError{Field: "file", Message: "file reader is required"}
+func (e *ExecdClient) newUploadFilesRequest(ctx context.Context, entries []UploadFileEntry) (*http.Request, io.Closer, error) {
+	if len(entries) == 0 {
+		return nil, nil, &InvalidArgumentError{Field: "entries", Message: "at least one file entry is required"}
 	}
-	if opts.Metadata.Path == "" {
-		return nil, nil, &InvalidArgumentError{Field: "metadata.path", Message: "path is required"}
-	}
-	fileName := opts.FileName
-	if fileName == "" {
-		fileName = "file"
+	for i, entry := range entries {
+		if entry.File == nil {
+			return nil, nil, &InvalidArgumentError{Field: fmt.Sprintf("entries[%d].file", i), Message: "file reader is required"}
+		}
+		if entry.Options.Metadata.Path == "" {
+			return nil, nil, &InvalidArgumentError{Field: fmt.Sprintf("entries[%d].metadata.path", i), Message: "path is required"}
+		}
 	}
 
 	pr, pw := io.Pipe()
@@ -295,28 +360,38 @@ func (e *ExecdClient) newUploadRequest(ctx context.Context, file io.Reader, opts
 	contentType := writer.FormDataContentType()
 
 	go func() {
-		metaJSON, err := json.Marshal(opts.Metadata)
-		if err != nil {
-			_ = pw.CloseWithError(fmt.Errorf("opensandbox: marshal metadata: %w", err))
-			return
-		}
-		metaPart, err := writer.CreateFormFile("metadata", "metadata")
-		if err != nil {
-			_ = pw.CloseWithError(fmt.Errorf("opensandbox: create metadata part: %w", err))
-			return
-		}
-		if _, err := metaPart.Write(metaJSON); err != nil {
-			_ = pw.CloseWithError(fmt.Errorf("opensandbox: write metadata: %w", err))
-			return
-		}
-		filePart, err := writer.CreateFormFile("file", fileName)
-		if err != nil {
-			_ = pw.CloseWithError(fmt.Errorf("opensandbox: create file part: %w", err))
-			return
-		}
-		if _, err := io.Copy(filePart, file); err != nil {
-			_ = pw.CloseWithError(fmt.Errorf("opensandbox: write file: %w", err))
-			return
+		for i, entry := range entries {
+			metaJSON, err := json.Marshal(entry.Options.Metadata)
+			if err != nil {
+				_ = pw.CloseWithError(fmt.Errorf("opensandbox: marshal metadata for entry %d: %w", i, err))
+				return
+			}
+			metaHeader := make(textproto.MIMEHeader)
+			metaHeader.Set("Content-Disposition", `form-data; name="metadata"; filename="metadata"`)
+			metaHeader.Set("Content-Type", "application/json")
+			metaPart, err := writer.CreatePart(metaHeader)
+			if err != nil {
+				_ = pw.CloseWithError(fmt.Errorf("opensandbox: create metadata part for entry %d: %w", i, err))
+				return
+			}
+			if _, err := metaPart.Write(metaJSON); err != nil {
+				_ = pw.CloseWithError(fmt.Errorf("opensandbox: write metadata for entry %d: %w", i, err))
+				return
+			}
+
+			fileName := entry.Options.FileName
+			if fileName == "" {
+				fileName = "file"
+			}
+			filePart, err := writer.CreateFormFile("file", fileName)
+			if err != nil {
+				_ = pw.CloseWithError(fmt.Errorf("opensandbox: create file part for entry %d: %w", i, err))
+				return
+			}
+			if _, err := io.Copy(filePart, entry.File); err != nil {
+				_ = pw.CloseWithError(fmt.Errorf("opensandbox: write file for entry %d: %w", i, err))
+				return
+			}
 		}
 		if err := writer.Close(); err != nil {
 			_ = pw.CloseWithError(fmt.Errorf("opensandbox: close multipart: %w", err))
@@ -334,11 +409,30 @@ func (e *ExecdClient) newUploadRequest(ctx context.Context, file io.Reader, opts
 	return req, pr, nil
 }
 
+// DownloadFileOptions configures line-based reading for DownloadFile.
+type DownloadFileOptions struct {
+	// Offset is the starting line number (1-based). Mutually exclusive with Range header.
+	Offset int
+	// Limit is the number of lines to return. Mutually exclusive with Range header.
+	Limit int
+}
+
 // DownloadFile downloads a file from the sandbox. The caller must close the
 // returned io.ReadCloser. Pass rangeHeader (e.g. "bytes=0-1023") for partial
-// content, or empty string for the full file.
-func (e *ExecdClient) DownloadFile(ctx context.Context, remotePath string, rangeHeader string) (io.ReadCloser, error) {
-	reqPath := "/files/download?path=" + url.QueryEscape(remotePath)
+// content, or empty string for the full file. Use opts for line-based reading.
+func (e *ExecdClient) DownloadFile(ctx context.Context, remotePath string, rangeHeader string, opts ...DownloadFileOptions) (io.ReadCloser, error) {
+	params := url.Values{}
+	params.Set("path", remotePath)
+	if len(opts) > 0 {
+		o := opts[0]
+		if o.Offset > 0 {
+			params.Set("offset", strconv.Itoa(o.Offset))
+		}
+		if o.Limit > 0 {
+			params.Set("limit", strconv.Itoa(o.Limit))
+		}
+	}
+	reqPath := "/files/download?" + params.Encode()
 
 	var resp *http.Response
 	err := e.client.withRetry(ctx, func() error {
@@ -346,6 +440,7 @@ func (e *ExecdClient) DownloadFile(ctx context.Context, remotePath string, range
 		if err != nil {
 			return fmt.Errorf("opensandbox: create request: %w", err)
 		}
+		req.Header.Set("User-Agent", "OpenSandbox-Go-SDK/"+Version)
 		for k, v := range e.client.headers {
 			req.Header.Set(k, v)
 		}
@@ -393,7 +488,9 @@ func OctalMode(m os.FileMode) int {
 
 // DeleteDirectory deletes a directory and all its contents recursively.
 func (e *ExecdClient) DeleteDirectory(ctx context.Context, path string) error {
-	reqPath := "/directories?path=" + url.QueryEscape(path)
+	params := url.Values{}
+	params.Set("path", path)
+	reqPath := "/directories?" + params.Encode()
 	return e.client.doRequest(ctx, http.MethodDelete, reqPath, nil, nil)
 }
 

@@ -22,7 +22,6 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"fmt"
 	"math/big"
 	"net/http"
@@ -352,8 +351,8 @@ func TestDefaultTransport(t *testing.T) {
 	if tr.MaxIdleConnsPerHost != 10 {
 		assert.Fail(t, fmt.Sprintf("MaxIdleConnsPerHost = %d, want 10", tr.MaxIdleConnsPerHost))
 	}
-	if tr.IdleConnTimeout != 90*time.Second {
-		assert.Fail(t, fmt.Sprintf("IdleConnTimeout = %v, want 90s", tr.IdleConnTimeout))
+	if tr.IdleConnTimeout != 30*time.Second {
+		assert.Fail(t, fmt.Sprintf("IdleConnTimeout = %v, want 30s", tr.IdleConnTimeout))
 	}
 	if tr.TLSHandshakeTimeout != 10*time.Second {
 		assert.Fail(t, fmt.Sprintf("TLSHandshakeTimeout = %v, want 10s", tr.TLSHandshakeTimeout))
@@ -637,6 +636,3 @@ func TestRetry_CustomRetryableStatusCodes(t *testing.T) {
 	require.Equal(t, "sbx-500-retried", got.ID)
 	require.Equal(t, int32(2), attempts.Load())
 }
-
-// suppress unused import warning
-var _ = json.Marshal

@@ -8,9 +8,16 @@ on:
 
 permissions:
   contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
 
 jobs:
+  release-preflight:
+    uses: ./.github/workflows/release-preflight.yml
+
   publish:
+    needs: release-preflight
     name: Publish (${{ matrix.sdk.name }})
     runs-on: ubuntu-latest
     strategy:
@@ -63,6 +70,12 @@ jobs:
             -p:ContinuousIntegrationBuild=true \
             ${EXTRA_PACK_ARGS} \
             --output ./artifacts/${{ matrix.sdk.name }}
+
+      - name: Attest built package
+        if: startsWith(github.ref, format('refs/tags/csharp/{0}/v', matrix.sdk.tagPrefix))
+        uses: actions/attest@v4
+        with:
+          subject-path: ./artifacts/${{ matrix.sdk.name }}/*.nupkg
 
       - name: Publish to NuGet
         if: startsWith(github.ref, format('refs/tags/csharp/{0}/v', matrix.sdk.tagPrefix))

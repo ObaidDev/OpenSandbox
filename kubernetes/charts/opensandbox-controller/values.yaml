@@ -44,6 +44,27 @@ controller:
     # -- Burst for Kubernetes client rate limiter.
     burst: 200
 
+  # -- Pause/Resume snapshot configuration
+  snapshot:
+    # -- Image used for commit operations (must contain nerdctl tool)
+    # DockerHub: opensandbox/image-committer:v0.1.1
+    imageCommitterImage: "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/image-committer:v0.1.1"
+    # -- Containerd socket path of host
+    containerdSocketPath: "/var/run/containerd/containerd.sock"
+    # -- Timeout duration for commit jobs
+    commitJobTimeout: "10m"
+    # -- OCI registry prefix used for snapshot images.
+    registry: ""
+    # -- Use insecure registry mode when pushing snapshot images.
+    registryInsecure: false
+    # -- Secret name used by commit Jobs to push snapshot images.
+    snapshotPushSecret: ""
+    # -- Secret name for pulling the image-committer image in commit Jobs.
+    # Required when imageCommitterImage is stored in a private registry.
+    imageCommitterPullSecret: ""
+    # -- Secret name injected into resumed sandboxes for pulling snapshot images.
+    resumePullSecret: ""
+
   # -- Enable leader election for controller manager
   leaderElection:
     enabled: true
@@ -132,14 +153,6 @@ crds:
   # -- Additional annotations to add to CRDs (will be merged with resource-policy if keep is true)
   annotations: {}
 
-# Network Policy configuration
-networkPolicy:
-  # -- Enable network policy
-  enabled: false
-  # -- Ingress rules for network policy
-  ingress: []
-  # -- Egress rules for network policy
-  egress: []
 
 # -- Additional environment variables for the controller
 extraEnv: []

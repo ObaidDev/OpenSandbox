@@ -34,16 +34,15 @@ import (
 
 var codeRunner codeExecutionRunner
 
-func InitCodeRunner() {
-	codeRunner = runtime.NewController(flag.JupyterServerHost, flag.JupyterServerToken)
+func InitCodeRunner() *runtime.Controller {
+	ctrl := runtime.NewController(flag.JupyterServerHost, flag.JupyterServerToken)
+	codeRunner = ctrl
+	return ctrl
 }
 
 // CodeInterpretingController handles code execution entrypoints.
 type CodeInterpretingController struct {
 	*basicController
-
-	// chunkWriter serializes SSE event writes to prevent interleaved output.
-	chunkWriter sync.Mutex
 }
 
 type codeExecutionRunner interface {
@@ -59,7 +58,7 @@ type codeExecutionRunner interface {
 	SeekBackgroundCommandOutput(session string, cursor int64) ([]byte, int64, error)
 	DeleteBashSession(sessionID string) error
 	Interrupt(sessionID string) error
-	CreatePTYSession(id, cwd string) (runtime.PTYSession, error)
+	CreatePTYSession(id, cwd, command string) (runtime.PTYSession, error)
 	GetPTYSession(id string) runtime.PTYSession
 	DeletePTYSession(id string) error
 	GetPTYSessionStatus(id string) (bool, int64, error)
@@ -131,7 +130,6 @@ func (c *CodeInterpretingController) RunCode() {
 	}
 
 	ctx, cancel := context.WithCancel(c.ctx.Request.Context())
-	defer cancel()
 	execStart := time.Now()
 	var recordOnce sync.Once
 	recordExecution := func(result string) {
@@ -145,7 +143,8 @@ func (c *CodeInterpretingController) RunCode() {
 		})
 	}
 	runCodeRequest := c.buildExecuteCodeRequest(request)
-	eventsHandler := c.setServerEventsHandler(ctx)
+	eventsHandler, stopSSE := c.setServerEventsHandler(ctx)
+	defer func() { cancel(); stopSSE() }()
 
 	// completeCh is closed when OnExecuteComplete fires, meaning the final SSE
 	// event has been written and flushed. We only wait for this callback as a
@@ -171,7 +170,9 @@ func (c *CodeInterpretingController) RunCode() {
 	}
 	runCodeRequest.Hooks = eventsHandler
 
-	c.setupSSEResponse()
+	// SSE headers are committed lazily on the first event write
+	// (see writeSingleEvent), so a synchronous error from Execute below can
+	// still be surfaced as a structured JSON error response.
 	err = codeRunner.Execute(runCodeRequest)
 	if err != nil {
 		recordExecution("failure")
@@ -361,7 +362,6 @@ func (c *CodeInterpretingController) RunInSession() {
 		Timeout:  timeout,
 	}
 	ctx, cancel := context.WithCancel(c.ctx.Request.Context())
-	defer cancel()
 	execStart := time.Now()
 	var recordOnce sync.Once
 	recordExecution := func(result string) {
@@ -385,7 +385,12 @@ func (c *CodeInterpretingController) RunInSession() {
 			close(completeCh)
 		})
 	}
-	hooks := c.setServerEventsHandler(ctx)
+	hooks, stopSSE := c.setServerEventsHandler(ctx)
+	// Cancel the context first (signals the ping goroutine to stop), then
+	// wait for it to fully exit before the handler returns. This prevents
+	// the ping goroutine from writing to the response after Go's net/http
+	// closes the response writer.
+	defer func() { cancel(); stopSSE() }()
 	origComplete := hooks.OnExecuteComplete
 	hooks.OnExecuteComplete = func(executionTime time.Duration) {
 		origComplete(executionTime)
@@ -400,7 +405,9 @@ func (c *CodeInterpretingController) RunInSession() {
 	}
 	runReq.Hooks = hooks
 
-	c.setupSSEResponse()
+	// SSE headers are committed lazily on the first event write
+	// (see writeSingleEvent), so a synchronous error from
+	// RunInBashSession can still be surfaced as a structured JSON error.
 	err := codeRunner.RunInBashSession(ctx, runReq)
 	if err != nil {
 		recordExecution("failure")

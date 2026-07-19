@@ -1,3 +1,17 @@
+# Copyright 2026 Alibaba Group Holding Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Built-in OpenSandbox skill metadata and rendering helpers."""
 
 from __future__ import annotations
@@ -25,8 +39,8 @@ BUILTIN_SKILLS: dict[str, SkillSpec] = {
         package_file="opensandbox-sandbox-troubleshooting.md",
         title="OpenSandbox Sandbox Troubleshooting",
         summary=(
-            "Triage failed or unhealthy sandboxes with state, health, summary, "
-            "inspect, events, logs, and concrete remediation steps."
+            "Triage failed or unhealthy sandboxes with state, health, stable "
+            "diagnostic logs/events, and concrete remediation steps."
         ),
         trigger_hint=(
             "Use when the user reports sandbox startup failures, crashes, OOM, "
@@ -89,6 +103,21 @@ BUILTIN_SKILLS: dict[str, SkillSpec] = {
             "for a sandbox, or debug domain allow and deny behavior."
         ),
         marker_id="opensandbox-network-egress",
+    ),
+    "credential-vault": SkillSpec(
+        slug="credential-vault",
+        package_file="opensandbox-credential-vault.md",
+        title="OpenSandbox Credential Vault",
+        summary=(
+            "Create, inspect, patch, and delete sandbox-local Credential Vault "
+            "state without exposing plaintext secrets in shell flags."
+        ),
+        trigger_hint=(
+            "Use when the user needs outbound credential injection for tools "
+            "inside a sandbox, or wants to manage Credential Vault credentials "
+            "and bindings at runtime."
+        ),
+        marker_id="opensandbox-credential-vault",
     ),
 }
 

@@ -18,6 +18,7 @@ package com.alibaba.opensandbox.sandbox
 
 import com.alibaba.opensandbox.sandbox.config.ConnectionConfig
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxReadyTimeoutException
+import com.alibaba.opensandbox.sandbox.domain.models.diagnostics.DiagnosticContent
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkPolicy
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkRule
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxEndpoint
@@ -25,6 +26,8 @@ import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxInfo
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxMetrics
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxRenewResponse
 import com.alibaba.opensandbox.sandbox.domain.services.Commands
+import com.alibaba.opensandbox.sandbox.domain.services.CredentialVault
+import com.alibaba.opensandbox.sandbox.domain.services.Diagnostics
 import com.alibaba.opensandbox.sandbox.domain.services.Egress
 import com.alibaba.opensandbox.sandbox.domain.services.Filesystem
 import com.alibaba.opensandbox.sandbox.domain.services.Health
@@ -68,6 +71,12 @@ class SandboxTest {
     lateinit var egressService: Egress
 
     @MockK
+    lateinit var credentialVaultService: CredentialVault
+
+    @MockK
+    lateinit var diagnosticsService: Diagnostics
+
+    @MockK
     lateinit var httpClientProvider: HttpClientProvider
 
     private lateinit var sandbox: Sandbox
@@ -92,8 +101,11 @@ class SandboxTest {
                 healthService = healthService,
                 metricsService = metricsService,
                 egressService = egressService,
+                credentialVaultService = credentialVaultService,
+                isolatedService = mockk(),
                 customHealthCheck = null,
                 httpClientProvider = httpClientProvider,
+                diagnosticsService = diagnosticsService,
             )
     }
 
@@ -110,6 +122,16 @@ class SandboxTest {
     @Test
     fun `metrics should return metrics service`() {
         assertSame(metricsService, sandbox.metrics())
+    }
+
+    @Test
+    fun `credentialVault should return credential vault service`() {
+        assertSame(credentialVaultService, sandbox.credentialVault())
+    }
+
+    @Test
+    fun `diagnostics should return diagnostics service`() {
+        assertSame(diagnosticsService, sandbox.diagnostics())
     }
 
     @Test
@@ -154,6 +176,28 @@ class SandboxTest {
     }
 
     @Test
+    fun `getDiagnosticLogs should delegate to diagnosticsService`() {
+        val expected = mockk<DiagnosticContent>()
+        every { diagnosticsService.getLogs(sandboxId, "container") } returns expected
+
+        val result = sandbox.getDiagnosticLogs("container")
+
+        assertSame(expected, result)
+        verify { diagnosticsService.getLogs(sandboxId, "container") }
+    }
+
+    @Test
+    fun `getDiagnosticEvents should delegate to diagnosticsService`() {
+        val expected = mockk<DiagnosticContent>()
+        every { diagnosticsService.getEvents(sandboxId, "runtime") } returns expected
+
+        val result = sandbox.getDiagnosticEvents("runtime")
+
+        assertSame(expected, result)
+        verify { diagnosticsService.getEvents(sandboxId, "runtime") }
+    }
+
+    @Test
     fun `renew should delegate to sandboxService`() {
         val timeout = Duration.ofMinutes(10)
         val expectedRenew = mockk<SandboxRenewResponse>()
@@ -186,6 +230,16 @@ class SandboxTest {
     }
 
     @Test
+    fun `deleteEgressRules should delegate to egressService`() {
+        val targets = listOf("bad.example.com", "*.blocked.org")
+        every { egressService.deleteRules(targets) } just Runs
+
+        sandbox.deleteEgressRules(targets)
+
+        verify { egressService.deleteRules(targets) }
+    }
+
+    @Test
     fun `builder manualCleanup should clear timeout`() {
         val builder =
             Sandbox.builder()
@@ -201,19 +255,23 @@ class SandboxTest {
 
     @Test
     fun `pause should delegate to sandboxService`() {
+        every { sandboxService.invalidateEndpointCache(sandboxId) } just Runs
         every { sandboxService.pauseSandbox(sandboxId) } just Runs
 
         sandbox.pause()
 
+        verify { sandboxService.invalidateEndpointCache(sandboxId) }
         verify { sandboxService.pauseSandbox(sandboxId) }
     }
 
     @Test
     fun `kill should delegate to sandboxService`() {
+        every { sandboxService.invalidateEndpointCache(sandboxId) } just Runs
         every { sandboxService.killSandbox(sandboxId) } just Runs
 
         sandbox.kill()
 
+        verify { sandboxService.invalidateEndpointCache(sandboxId) }
         verify { sandboxService.killSandbox(sandboxId) }
     }
 

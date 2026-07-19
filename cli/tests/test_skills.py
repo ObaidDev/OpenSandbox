@@ -362,6 +362,18 @@ class TestSkillsCommands:
         assert "Quick Start:" in result.output
         assert "osb egress patch" in result.output
 
+    def test_show_supports_credential_vault_skill(
+        self,
+        runner: CliRunner,
+        isolated_skill_targets: None,
+    ) -> None:
+        result = runner.invoke(skills_group, ["show", "credential-vault"])
+
+        assert result.exit_code == 0
+        assert "Skill: credential-vault" in result.output
+        assert "Credential Vault" in result.output
+        assert "osb credential-vault create" in result.output
+
     def test_show_surfaces_json_shapes_for_lifecycle_skill(
         self,
         runner: CliRunner,
@@ -516,9 +528,33 @@ class TestSkillContentQuality:
 
         assert "## Triage Order" in content
         assert "osb sandbox get <sandbox-id> -o json" in content
-        assert "osb devops summary <sandbox-id> -o raw" in content
+        assert "osb diagnostics events <sandbox-id> --scope lifecycle -o raw" in content
+        assert "osb diagnostics events <sandbox-id> --scope runtime -o raw" in content
+        assert "osb diagnostics logs <sandbox-id> --scope container -o raw" in content
         assert "## Diagnostics Streams" in content
+        assert "## Evidence Semantics" in content
+        assert "## URL Delivery" in content
+        assert "truncated: true" in content
+        assert "osb devops" not in content
         assert "## Symptom To Command Mapping" in content
+
+    def test_builtin_skills_do_not_reference_legacy_devops_diagnostics(self) -> None:
+        skills_dir = Path("src/opensandbox_cli/skills")
+        forbidden = (
+            "osb devops inspect",
+            "osb devops summary",
+            "devops inspect",
+            "devops summary",
+        )
+
+        violations: list[str] = []
+        for skill_path in sorted(skills_dir.glob("*.md")):
+            content = skill_path.read_text(encoding="utf-8")
+            for term in forbidden:
+                if term in content:
+                    violations.append(f"{skill_path.name}: {term}")
+
+        assert violations == []
 
     def test_lifecycle_skill_keeps_json_shapes_and_health_guidance(self) -> None:
         content = _read_builtin_skill("opensandbox-sandbox-lifecycle.md")
@@ -558,7 +594,8 @@ class TestSkillCliAlignment:
 
         assert {
             "-i", "--image", "-t", "--timeout", "--entrypoint", "--network-policy-file",
-            "--volumes-file", "--skip-health-check", "--ready-timeout", "-o", "--output",
+            "--credential-proxy", "--volumes-file", "--skip-health-check",
+            "--ready-timeout", "-o", "--output",
         } <= _option_names(create_cmd)
         assert {"--skip-health-check", "--resume-timeout", "-o", "--output"} <= _option_names(resume_cmd)
         assert {"-p", "--port", "-o", "--output"} <= _option_names(endpoint_cmd)
@@ -580,16 +617,32 @@ class TestSkillCliAlignment:
         assert {"--mode", "--owner", "--group", "-o", "--output"} <= _option_names(_command(["file", "chmod"]))
         assert {"--old", "--new", "-o", "--output"} <= _option_names(_command(["file", "replace"]))
 
-    def test_network_egress_and_devops_skills_match_cli(self) -> None:
+    def test_network_egress_diagnostics_and_devops_skills_match_cli(self) -> None:
         patch_cmd = _command(["egress", "patch"])
+        diag_logs_cmd = _command(["diagnostics", "logs"])
+        diag_events_cmd = _command(["diagnostics", "events"])
         logs_cmd = _command(["devops", "logs"])
         events_cmd = _command(["devops", "events"])
         summary_cmd = _command(["devops", "summary"])
 
         assert {"--rule", "-o", "--output"} <= _option_names(patch_cmd)
+        assert {"--scope", "-s", "-o", "--output"} <= _option_names(diag_logs_cmd)
+        assert {"--scope", "-s", "-o", "--output"} <= _option_names(diag_events_cmd)
         assert {"--tail", "-n", "--since", "-s", "-o", "--output"} <= _option_names(logs_cmd)
         assert {"--limit", "-l", "-o", "--output"} <= _option_names(events_cmd)
         assert {"--tail", "-n", "--event-limit", "-o", "--output"} <= _option_names(summary_cmd)
+
+    def test_credential_vault_skill_matches_cli(self) -> None:
+        vault_group = _command(["credential-vault"])
+        assert isinstance(vault_group, Group)
+        assert {"create", "get", "patch", "delete", "credential", "binding"} <= set(vault_group.commands)
+
+        assert {"--file", "-o", "--output"} <= _option_names(_command(["credential-vault", "create"]))
+        assert {"--file", "-o", "--output"} <= _option_names(_command(["credential-vault", "patch"]))
+        assert {"-o", "--output"} <= _option_names(_command(["credential-vault", "get"]))
+        assert {"-o", "--output"} <= _option_names(_command(["credential-vault", "delete"]))
+        assert {"-o", "--output"} <= _option_names(_command(["credential-vault", "credential", "list"]))
+        assert {"-o", "--output"} <= _option_names(_command(["credential-vault", "binding", "get"]))
 
     def test_skill_osb_examples_use_explicit_output_formats(self) -> None:
         allowed_without_output = {

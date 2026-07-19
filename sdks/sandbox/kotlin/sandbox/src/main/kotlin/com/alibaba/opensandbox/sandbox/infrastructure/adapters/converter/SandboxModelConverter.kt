@@ -23,15 +23,19 @@ import com.alibaba.opensandbox.sandbox.api.models.Endpoint
 import com.alibaba.opensandbox.sandbox.api.models.ImageSpec
 import com.alibaba.opensandbox.sandbox.api.models.ImageSpecAuth
 import com.alibaba.opensandbox.sandbox.api.models.ListSandboxesResponse
+import com.alibaba.opensandbox.sandbox.api.models.ListSnapshotsResponse
 import com.alibaba.opensandbox.sandbox.api.models.RenewSandboxExpirationRequest
 import com.alibaba.opensandbox.sandbox.api.models.RenewSandboxExpirationResponse
+import com.alibaba.opensandbox.sandbox.api.models.Snapshot
 import com.alibaba.opensandbox.sandbox.api.models.execd.Metrics
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialProxyConfig
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.Host
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkPolicy
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkRule
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.OSSFS
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PVC
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PagedSandboxInfos
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PagedSnapshotInfos
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PaginationInfo
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PlatformSpec
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxCreateResponse
@@ -41,9 +45,12 @@ import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxImageSpec
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxInfo
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxMetrics
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxRenewResponse
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotInfo
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotStatus
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.Volume
 import java.time.Duration
 import java.time.OffsetDateTime
+import com.alibaba.opensandbox.sandbox.api.models.CredentialProxyConfig as ApiCredentialProxyConfig
 import com.alibaba.opensandbox.sandbox.api.models.Host as ApiHost
 import com.alibaba.opensandbox.sandbox.api.models.NetworkPolicy as ApiNetworkPolicy
 import com.alibaba.opensandbox.sandbox.api.models.NetworkRule as ApiNetworkRule
@@ -182,6 +189,10 @@ internal object SandboxModelConverter {
             .build()
     }
 
+    fun CredentialProxyConfig.toApiCredentialProxyConfig(): ApiCredentialProxyConfig {
+        return ApiCredentialProxyConfig(enabled = this.enabled)
+    }
+
     /**
      * Converts Domain Host -> API Host
      */
@@ -238,27 +249,33 @@ internal object SandboxModelConverter {
     }
 
     fun toApiCreateSandboxRequest(
-        spec: SandboxImageSpec,
-        entrypoint: List<String>,
+        spec: SandboxImageSpec?,
+        entrypoint: List<String>?,
         env: Map<String, String>,
         metadata: Map<String, String>,
         timeout: Duration?,
         resource: Map<String, String>,
         platform: PlatformSpec?,
         networkPolicy: NetworkPolicy?,
+        credentialProxy: CredentialProxyConfig?,
         secureAccess: Boolean,
         extensions: Map<String, String>,
         volumes: List<Volume>?,
+        snapshotId: String?,
+        resourceRequests: Map<String, String>? = null,
     ): CreateSandboxRequest {
         return CreateSandboxRequest(
-            image = spec.toApiImageSpec(),
+            image = spec?.toApiImageSpec(),
+            snapshotId = snapshotId,
             entrypoint = entrypoint,
             timeout = timeout?.seconds?.toInt(),
             env = env,
             metadata = metadata,
             resourceLimits = resource,
+            resourceRequests = resourceRequests,
             platform = platform?.toApiPlatformSpec(),
             networkPolicy = networkPolicy?.toApiNetworkPolicy(),
+            credentialProxy = credentialProxy?.toApiCredentialProxyConfig(),
             secureAccess = secureAccess,
             extensions = extensions,
             volumes = volumes?.map { it.toApiVolume() },
@@ -301,13 +318,12 @@ internal object SandboxModelConverter {
             entrypoint = this.entrypoint,
             expiresAt = this.expiresAt,
             createdAt = this.createdAt,
-            image =
-                requireNotNull(this.image) {
-                    "Sandbox image is missing from API response. Snapshot-based sandbox responses are not supported by this SDK yet."
-                }.toImageSpec(),
+            image = this.image?.toImageSpec(),
+            snapshotId = this.snapshotId,
             platform = this.platform?.toDomainPlatformSpec(),
             status = this.status.toSandboxStatus(),
             metadata = metadata,
+            extensions = extensions,
         )
     }
 
@@ -357,6 +373,7 @@ internal object SandboxModelConverter {
         return SandboxCreateResponse(
             id = this.id,
             platform = this.platform?.toDomainPlatformSpec(),
+            extensions = this.extensions,
         )
     }
 
@@ -376,6 +393,29 @@ internal object SandboxModelConverter {
     fun ListSandboxesResponse.toPagedSandboxInfos(): PagedSandboxInfos {
         return PagedSandboxInfos(
             items.map { it.toSandboxInfo() },
+            pagination.toPaginationInfo(),
+        )
+    }
+
+    fun Snapshot.toSnapshotInfo(): SnapshotInfo {
+        return SnapshotInfo(
+            id = this.id,
+            sandboxId = this.sandboxId,
+            name = this.name,
+            status =
+                SnapshotStatus(
+                    state = this.status.state,
+                    reason = this.status.reason,
+                    message = this.status.message,
+                    lastTransitionAt = this.status.lastTransitionAt,
+                ),
+            createdAt = this.createdAt,
+        )
+    }
+
+    fun ListSnapshotsResponse.toPagedSnapshotInfos(): PagedSnapshotInfos {
+        return PagedSnapshotInfos(
+            items.map { it.toSnapshotInfo() },
             pagination.toPaginationInfo(),
         )
     }

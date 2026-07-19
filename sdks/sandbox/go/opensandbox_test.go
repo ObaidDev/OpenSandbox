@@ -81,15 +81,15 @@ func TestCreateSandbox(t *testing.T) {
 
 		var req CreateSandboxRequest
 		json.NewDecoder(r.Body).Decode(&req)
-		if req.Image.URI != "python:3.12" {
-			assert.Fail(t, fmt.Sprintf("expected image python:3.12, got %s", req.Image.URI))
+		if req.Image == nil || req.Image.URI != "python:3.12" {
+			assert.Fail(t, fmt.Sprintf("expected image python:3.12, got %+v", req.Image))
 		}
 
 		jsonResponse(w, http.StatusCreated, want)
 	})
 
 	got, err := client.CreateSandbox(context.Background(), CreateSandboxRequest{
-		Image:      ImageSpec{URI: "python:3.12"},
+		Image:      &ImageSpec{URI: "python:3.12"},
 		Entrypoint: []string{"/bin/sh"},
 		ResourceLimits: ResourceLimits{
 			"cpu":    "500m",
@@ -110,7 +110,7 @@ func TestCreateSandbox_ImageAuth(t *testing.T) {
 		var req CreateSandboxRequest
 		json.NewDecoder(r.Body).Decode(&req)
 
-		if req.Image.Auth == nil {
+		if req.Image == nil || req.Image.Auth == nil {
 			require.FailNow(t, "expected ImageAuth to be set")
 		}
 		if req.Image.Auth.Username != "user" {
@@ -128,7 +128,7 @@ func TestCreateSandbox_ImageAuth(t *testing.T) {
 	})
 
 	_, err := client.CreateSandbox(context.Background(), CreateSandboxRequest{
-		Image: ImageSpec{
+		Image: &ImageSpec{
 			URI:  "registry.example.com/private:latest",
 			Auth: &ImageAuth{Username: "user", Password: "pass"},
 		},
@@ -136,6 +136,49 @@ func TestCreateSandbox_ImageAuth(t *testing.T) {
 		ResourceLimits: ResourceLimits{"cpu": "500m"},
 	})
 	require.NoErrorf(t, err, "CreateSandbox with ImageAuth")
+}
+
+func TestPatchSandboxMetadata(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	value := "platform"
+
+	_, client := newLifecycleServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch {
+			assert.Fail(t, fmt.Sprintf("expected PATCH, got %s", r.Method))
+		}
+		if r.URL.Path != "/sandboxes/sbx-123/metadata" {
+			assert.Fail(t, fmt.Sprintf("expected /sandboxes/sbx-123/metadata, got %s", r.URL.Path))
+		}
+
+		var body map[string]*string
+		require.NoErrorf(t, json.NewDecoder(r.Body).Decode(&body), "decode metadata patch")
+		require.NotNil(t, body["team"])
+		if *body["team"] != "platform" {
+			assert.Fail(t, fmt.Sprintf("team = %q, want platform", *body["team"]))
+		}
+		_, hasOld := body["old"]
+		require.True(t, hasOld, "old metadata key should be present")
+		if body["old"] != nil {
+			assert.Fail(t, "old metadata key should be null")
+		}
+
+		jsonResponse(w, http.StatusOK, SandboxInfo{
+			ID:         "sbx-123",
+			Status:     SandboxStatus{State: StateRunning},
+			Metadata:   map[string]string{"team": "platform"},
+			Entrypoint: []string{"/bin/sh"},
+			CreatedAt:  now,
+		})
+	})
+
+	got, err := client.PatchSandboxMetadata(context.Background(), "sbx-123", MetadataPatch{
+		"team": &value,
+		"old":  nil,
+	})
+	require.NoErrorf(t, err, "PatchSandboxMetadata")
+	if got.Metadata["team"] != "platform" {
+		assert.Fail(t, fmt.Sprintf("team = %q, want platform", got.Metadata["team"]))
+	}
 }
 
 func TestCreateSandbox_SecureAccess(t *testing.T) {
@@ -155,7 +198,7 @@ func TestCreateSandbox_SecureAccess(t *testing.T) {
 	})
 
 	_, err := client.CreateSandbox(context.Background(), CreateSandboxRequest{
-		Image:          ImageSpec{URI: "python:3.12"},
+		Image:          &ImageSpec{URI: "python:3.12"},
 		Entrypoint:     []string{"/bin/sh"},
 		ResourceLimits: ResourceLimits{"cpu": "500m"},
 		SecureAccess:   true,
@@ -181,12 +224,105 @@ func TestCreateSandbox_ManualCleanup(t *testing.T) {
 	})
 
 	_, err := client.CreateSandbox(context.Background(), CreateSandboxRequest{
-		Image:          ImageSpec{URI: "python:3.12"},
+		Image:          &ImageSpec{URI: "python:3.12"},
 		Entrypoint:     []string{"/bin/sh"},
 		ResourceLimits: ResourceLimits{"cpu": "500m"},
 		// Timeout is nil — simulates ManualCleanup (no timeout sent)
 	})
 	require.NoErrorf(t, err, "CreateSandbox with ManualCleanup")
+}
+
+func TestCreateSandbox_FromSnapshot(t *testing.T) {
+	_, client := newLifecycleServer(t, func(w http.ResponseWriter, r *http.Request) {
+		var req CreateSandboxRequest
+		json.NewDecoder(r.Body).Decode(&req)
+
+		if req.SnapshotID != "snap-123" {
+			assert.Fail(t, fmt.Sprintf("SnapshotID = %q, want %q", req.SnapshotID, "snap-123"))
+		}
+		if req.Image != nil {
+			assert.Fail(t, "expected image to be omitted for snapshot restore")
+		}
+		if len(req.Entrypoint) != 0 {
+			assert.Fail(t, "expected entrypoint to be omitted for snapshot restore")
+		}
+
+		jsonResponse(w, http.StatusCreated, SandboxInfo{
+			ID:         "sbx-snapshot",
+			SnapshotID: "snap-123",
+			Status:     SandboxStatus{State: StatePending},
+			CreatedAt:  time.Now().UTC().Truncate(time.Second),
+			Entrypoint: []string{"/bin/sh"},
+		})
+	})
+
+	_, err := client.CreateSandbox(context.Background(), CreateSandboxRequest{
+		SnapshotID:     "snap-123",
+		ResourceLimits: ResourceLimits{"cpu": "500m"},
+	})
+	require.NoErrorf(t, err, "CreateSandbox from snapshot")
+}
+
+func TestCreateSandbox_Platform(t *testing.T) {
+	_, client := newLifecycleServer(t, func(w http.ResponseWriter, r *http.Request) {
+		var req CreateSandboxRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			assert.Fail(t, fmt.Sprintf("decode request: %v", err))
+			return
+		}
+		require.NotNil(t, req.Platform, "expected Platform to be sent in the request")
+		require.Equal(t, OSWindows, req.Platform.OS, "Platform.OS")
+		require.Equal(t, ArchAMD64, req.Platform.Arch, "Platform.Arch")
+
+		jsonResponse(w, http.StatusCreated, SandboxInfo{
+			ID:        "sbx-windows",
+			Status:    SandboxStatus{State: StatePending},
+			Platform:  &PlatformSpec{OS: OSWindows, Arch: ArchAMD64},
+			CreatedAt: time.Now().UTC().Truncate(time.Second),
+		})
+	})
+
+	info, err := client.CreateSandbox(context.Background(), CreateSandboxRequest{
+		Image:          &ImageSpec{URI: "dockurr/windows:latest"},
+		Entrypoint:     []string{"cmd", "/c", "echo hi"},
+		ResourceLimits: ResourceLimits{"cpu": "2", "memory": "4G", "disk": "64G"},
+		Platform:       &PlatformSpec{OS: OSWindows, Arch: ArchAMD64},
+	})
+	require.NoErrorf(t, err, "CreateSandbox with Platform")
+	require.NotNil(t, info.Platform, "response should echo Platform")
+	require.Equal(t, OSWindows, info.Platform.OS, "echoed Platform.OS")
+	require.Equal(t, ArchAMD64, info.Platform.Arch, "echoed Platform.Arch")
+}
+
+func TestCreateSandbox_PlatformOmittedWhenNil(t *testing.T) {
+	_, client := newLifecycleServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			assert.Fail(t, fmt.Sprintf("read request body: %v", err))
+			return
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(body, &raw); err != nil {
+			assert.Fail(t, fmt.Sprintf("unmarshal request body: %v", err))
+			return
+		}
+		if _, present := raw["platform"]; present {
+			assert.Fail(t, "platform should be omitted from JSON when nil")
+		}
+
+		jsonResponse(w, http.StatusCreated, SandboxInfo{
+			ID:        "sbx-no-platform",
+			Status:    SandboxStatus{State: StatePending},
+			CreatedAt: time.Now().UTC().Truncate(time.Second),
+		})
+	})
+
+	_, err := client.CreateSandbox(context.Background(), CreateSandboxRequest{
+		Image:          &ImageSpec{URI: "python:3.12"},
+		Entrypoint:     []string{"/bin/sh"},
+		ResourceLimits: ResourceLimits{"cpu": "500m"},
+	})
+	require.NoErrorf(t, err, "CreateSandbox without Platform")
 }
 
 func TestGetSandbox(t *testing.T) {
@@ -273,6 +409,72 @@ func TestDeleteSandbox(t *testing.T) {
 
 	err := client.DeleteSandbox(context.Background(), "sbx-789")
 	require.NoErrorf(t, err, "DeleteSandbox")
+}
+
+func TestSnapshotLifecycle(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+
+	_, client := newLifecycleServer(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/sandboxes/sbx-1/snapshots":
+			var req CreateSnapshotRequest
+			json.NewDecoder(r.Body).Decode(&req)
+			if req.Name != "before-upgrade" {
+				assert.Fail(t, fmt.Sprintf("Name = %q, want %q", req.Name, "before-upgrade"))
+			}
+			jsonResponse(w, http.StatusAccepted, SnapshotInfo{
+				ID:        "snap-1",
+				SandboxID: "sbx-1",
+				Name:      "before-upgrade",
+				Status:    SnapshotStatus{State: SnapshotStateCreating},
+				CreatedAt: now,
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/snapshots/snap-1":
+			jsonResponse(w, http.StatusOK, SnapshotInfo{
+				ID:        "snap-1",
+				SandboxID: "sbx-1",
+				Status:    SnapshotStatus{State: SnapshotStateReady},
+				CreatedAt: now,
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/snapshots":
+			if r.URL.Query().Get("sandboxId") != "sbx-1" {
+				assert.Fail(t, fmt.Sprintf("sandboxId = %q, want %q", r.URL.Query().Get("sandboxId"), "sbx-1"))
+			}
+			jsonResponse(w, http.StatusOK, ListSnapshotsResponse{
+				Items: []SnapshotInfo{{
+					ID:        "snap-1",
+					SandboxID: "sbx-1",
+					Status:    SnapshotStatus{State: SnapshotStateReady},
+					CreatedAt: now,
+				}},
+				Pagination: PaginationInfo{Page: 1, PageSize: 10, TotalItems: 1, TotalPages: 1},
+			})
+		case r.Method == http.MethodDelete && r.URL.Path == "/snapshots/snap-1":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			assert.Fail(t, fmt.Sprintf("unexpected request: %s %s", r.Method, r.URL.Path))
+		}
+	})
+
+	created, err := client.CreateSnapshot(context.Background(), "sbx-1", CreateSnapshotRequest{Name: "before-upgrade"})
+	require.NoErrorf(t, err, "CreateSnapshot")
+	require.Equal(t, "snap-1", created.ID)
+
+	got, err := client.GetSnapshot(context.Background(), "snap-1")
+	require.NoErrorf(t, err, "GetSnapshot")
+	require.Equal(t, SnapshotStateReady, got.Status.State)
+
+	listed, err := client.ListSnapshots(context.Background(), ListSnapshotsOptions{
+		SandboxID: "sbx-1",
+		States:    []SnapshotState{SnapshotStateReady},
+		Page:      1,
+		PageSize:  10,
+	})
+	require.NoErrorf(t, err, "ListSnapshots")
+	require.Len(t, listed.Items, 1)
+
+	err = client.DeleteSnapshot(context.Background(), "snap-1")
+	require.NoErrorf(t, err, "DeleteSnapshot")
 }
 
 func TestResumeSandbox(t *testing.T) {
@@ -436,6 +638,47 @@ func TestPatchPolicy(t *testing.T) {
 	require.NoErrorf(t, err, "PatchPolicy")
 	require.NotNil(t, got.Policy)
 	require.Len(t, got.Policy.Egress, 2)
+}
+
+func TestDeletePolicy(t *testing.T) {
+	want := PolicyStatusResponse{
+		Status: "ok",
+		Mode:   "deny_all",
+		Policy: &NetworkPolicy{
+			DefaultAction: "deny",
+			Egress: []NetworkRule{
+				{Action: "allow", Target: "api.example.com"},
+			},
+		},
+	}
+
+	_, client := newEgressServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			assert.Fail(t, fmt.Sprintf("expected DELETE, got %s", r.Method))
+		}
+
+		var targets []string
+		if err := json.NewDecoder(r.Body).Decode(&targets); err != nil {
+			assert.Fail(t, fmt.Sprintf("decode body: %v", err))
+		}
+		if len(targets) != 2 {
+			assert.Fail(t, fmt.Sprintf("expected 2 targets in request, got %d", len(targets)))
+		}
+		if targets[0] != "bad.example.com" || targets[1] != "*.blocked.org" {
+			assert.Fail(t, fmt.Sprintf("unexpected targets: %v", targets))
+		}
+
+		jsonResponse(w, http.StatusOK, want)
+	})
+
+	got, err := client.DeletePolicy(context.Background(), []string{
+		"bad.example.com",
+		"*.blocked.org",
+	})
+	require.NoErrorf(t, err, "DeletePolicy")
+	require.NotNil(t, got.Policy)
+	require.Len(t, got.Policy.Egress, 1)
+	require.Equal(t, "api.example.com", got.Policy.Egress[0].Target)
 }
 
 func TestPing(t *testing.T) {
@@ -664,6 +907,66 @@ func TestUploadFile_WithReader(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestUploadFiles(t *testing.T) {
+	_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodPost, r.Method)
+		require.Equal(t, "/files/upload", r.URL.Path)
+		require.True(t, strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data"))
+
+		require.NoError(t, r.ParseMultipartForm(1<<20))
+		metadataParts := r.MultipartForm.File["metadata"]
+		fileParts := r.MultipartForm.File["file"]
+		require.Len(t, metadataParts, 2)
+		require.Len(t, fileParts, 2)
+
+		wantPaths := []string{"/sandbox/a.txt", "/sandbox/b.txt"}
+		wantFileNames := []string{"a.txt", "custom-b.txt"}
+		wantContents := []string{"alpha", "bravo"}
+
+		for i := range metadataParts {
+			metaFile, err := metadataParts[i].Open()
+			require.NoError(t, err)
+			require.Equal(t, "application/json", metadataParts[i].Header.Get("Content-Type"))
+			metaBytes, err := io.ReadAll(metaFile)
+			require.NoError(t, err)
+			require.NoError(t, metaFile.Close())
+
+			var meta FileMetadata
+			require.NoError(t, json.Unmarshal(metaBytes, &meta))
+			require.Equal(t, wantPaths[i], meta.Path)
+			require.Equal(t, 600+i, meta.Mode)
+
+			filePart, err := fileParts[i].Open()
+			require.NoError(t, err)
+			data, err := io.ReadAll(filePart)
+			require.NoError(t, err)
+			require.NoError(t, filePart.Close())
+			require.Equal(t, wantFileNames[i], fileParts[i].Filename)
+			require.Equal(t, wantContents[i], string(data))
+		}
+
+		w.WriteHeader(http.StatusOK)
+	})
+
+	err := client.UploadFiles(context.Background(), []UploadFileEntry{
+		{
+			File: strings.NewReader("alpha"),
+			Options: UploadFileOptions{
+				FileName: "a.txt",
+				Metadata: FileMetadata{Path: "/sandbox/a.txt", Mode: 600},
+			},
+		},
+		{
+			File: strings.NewReader("bravo"),
+			Options: UploadFileOptions{
+				FileName: "custom-b.txt",
+				Metadata: FileMetadata{Path: "/sandbox/b.txt", Mode: 601},
+			},
+		},
+	})
+	require.NoError(t, err)
+}
+
 func TestGetMetrics(t *testing.T) {
 	want := Metrics{
 		CPUCount:   4,
@@ -822,6 +1125,92 @@ func TestExecdAuthHeader(t *testing.T) {
 	require.NoErrorf(t, err, "Ping")
 }
 
+// TestResolveExecdForwardsAllEndpointHeaders verifies that every header
+// returned by GetEndpoint (auth tokens, routing hints, sticky-session keys,
+// etc.) is forwarded as-is on subsequent execd requests, mirroring the
+// Python SDK behavior.
+func TestResolveExecdForwardsAllEndpointHeaders(t *testing.T) {
+	endpointHeaders := map[string]string{
+		"X-EXECD-ACCESS-TOKEN": "execd-tok",
+		"X-Route-Hint":         "vip-pool",
+		"X-Sticky-Session":     "sess-abc",
+	}
+
+	execdSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for k, want := range endpointHeaders {
+			if got := r.Header.Get(k); got != want {
+				assert.Fail(t, fmt.Sprintf("header %s = %q, want %q", k, got, want))
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer execdSrv.Close()
+
+	lifecycleSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/endpoints/") {
+			jsonResponse(w, http.StatusOK, Endpoint{
+				Endpoint: execdSrv.URL,
+				Headers:  endpointHeaders,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer lifecycleSrv.Close()
+
+	config := ConnectionConfig{Domain: lifecycleSrv.URL}
+	sb := &Sandbox{
+		id:        "sbx-headers",
+		config:    &config,
+		lifecycle: config.lifecycleClient(),
+	}
+
+	require.NoErrorf(t, sb.resolveExecd(context.Background()), "resolveExecd")
+	require.NoErrorf(t, sb.execd.Ping(context.Background()), "Ping")
+}
+
+// TestResolveEgressForwardsAllEndpointHeaders verifies the same forwarding
+// behavior for the egress sidecar client.
+func TestResolveEgressForwardsAllEndpointHeaders(t *testing.T) {
+	endpointHeaders := map[string]string{
+		"OPENSANDBOX-EGRESS-AUTH": "egress-tok",
+		"X-Route-Hint":            "egress-vip",
+	}
+
+	egressSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for k, want := range endpointHeaders {
+			if got := r.Header.Get(k); got != want {
+				assert.Fail(t, fmt.Sprintf("header %s = %q, want %q", k, got, want))
+			}
+		}
+		jsonResponse(w, http.StatusOK, PolicyStatusResponse{Status: "ok"})
+	}))
+	defer egressSrv.Close()
+
+	lifecycleSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/endpoints/") {
+			jsonResponse(w, http.StatusOK, Endpoint{
+				Endpoint: egressSrv.URL,
+				Headers:  endpointHeaders,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer lifecycleSrv.Close()
+
+	config := ConnectionConfig{Domain: lifecycleSrv.URL}
+	sb := &Sandbox{
+		id:        "sbx-egress-headers",
+		config:    &config,
+		lifecycle: config.lifecycleClient(),
+	}
+
+	require.NoErrorf(t, sb.resolveEgress(context.Background()), "resolveEgress")
+	_, err := sb.egress.GetPolicy(context.Background())
+	require.NoErrorf(t, err, "GetPolicy")
+}
+
 func TestSandboxManager_ListFilter(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	want := ListSandboxesResponse{
@@ -907,9 +1296,10 @@ func TestSandboxManager_ListMultipleStates(t *testing.T) {
 
 func TestSandboxManager_GetSandboxInfo(t *testing.T) {
 	want := SandboxInfo{
-		ID:        "sbx-get",
-		Status:    SandboxStatus{State: StateRunning},
-		CreatedAt: time.Now().UTC().Truncate(time.Second),
+		ID:         "sbx-get",
+		Status:     SandboxStatus{State: StateRunning},
+		Extensions: map[string]string{"opensandbox.extensions.custom-label": "中文数据"},
+		CreatedAt:  time.Now().UTC().Truncate(time.Second),
 	}
 
 	_, client := newLifecycleServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -928,6 +1318,7 @@ func TestSandboxManager_GetSandboxInfo(t *testing.T) {
 	if got.ID != "sbx-get" {
 		assert.Fail(t, fmt.Sprintf("ID = %q, want %q", got.ID, "sbx-get"))
 	}
+	require.Equal(t, "中文数据", got.Extensions["opensandbox.extensions.custom-label"])
 }
 
 func TestSandboxManager_KillSandbox(t *testing.T) {
@@ -1142,6 +1533,74 @@ func TestSearchFiles(t *testing.T) {
 	}
 }
 
+func TestListDirectoryDefault(t *testing.T) {
+	want := []FileInfo{
+		{Path: "/sandbox/src", Type: "directory", Size: 0, Owner: "root", Group: "root", Mode: 755},
+		{Path: "/sandbox/README.md", Type: "file", Size: 256, Owner: "root", Group: "root", Mode: 644},
+	}
+
+	_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			assert.Fail(t, fmt.Sprintf("expected GET, got %s", r.Method))
+		}
+		if r.URL.Path != "/directories/list" {
+			assert.Fail(t, fmt.Sprintf("expected /directories/list, got %s", r.URL.Path))
+		}
+		if r.URL.Query().Get("path") != "/sandbox" {
+			assert.Fail(t, fmt.Sprintf("expected path=/sandbox, got %s", r.URL.Query().Get("path")))
+		}
+		// ListDirectory should not pin a depth value; the server applies the
+		// default. Sending depth=... here would be a regression.
+		if _, ok := r.URL.Query()["depth"]; ok {
+			assert.Fail(t, fmt.Sprintf("expected depth to be omitted, got %q", r.URL.Query().Get("depth")))
+		}
+
+		jsonResponse(w, http.StatusOK, want)
+	})
+
+	got, err := client.ListDirectory(context.Background(), "/sandbox")
+	require.NoErrorf(t, err, "ListDirectory")
+	require.Len(t, got, 2)
+	require.Equal(t, "directory", got[0].Type)
+	require.Equal(t, "file", got[1].Type)
+}
+
+func TestListDirectoryWithDepth(t *testing.T) {
+	want := []FileInfo{
+		{Path: "/sandbox/src", Type: "directory", Size: 0, Owner: "root", Group: "root", Mode: 755},
+	}
+
+	_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("depth") != "2" {
+			assert.Fail(t, fmt.Sprintf("expected depth=2, got %s", r.URL.Query().Get("depth")))
+		}
+
+		jsonResponse(w, http.StatusOK, want)
+	})
+
+	got, err := client.ListDirectoryWithDepth(context.Background(), "/sandbox", 2)
+	require.NoErrorf(t, err, "ListDirectoryWithDepth")
+	require.Len(t, got, 1)
+	require.Equal(t, "directory", got[0].Type)
+}
+
+func TestListDirectoryWithDepthZero(t *testing.T) {
+	_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/directories/list" {
+			assert.Fail(t, fmt.Sprintf("expected /directories/list, got %s", r.URL.Path))
+		}
+		if r.URL.Query().Get("depth") != "0" {
+			assert.Fail(t, fmt.Sprintf("expected depth=0, got %s", r.URL.Query().Get("depth")))
+		}
+
+		jsonResponse(w, http.StatusOK, []FileInfo{})
+	})
+
+	got, err := client.ListDirectoryWithDepth(context.Background(), "/sandbox", 0)
+	require.NoErrorf(t, err, "ListDirectoryWithDepth")
+	require.Len(t, got, 0)
+}
+
 func TestSetPermissions(t *testing.T) {
 	_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -1199,6 +1658,34 @@ func TestReplaceInFiles(t *testing.T) {
 		"/tmp/config.txt": {Old: "localhost", New: "production.example.com"},
 	})
 	require.NoErrorf(t, err, "ReplaceInFiles")
+}
+
+func TestReplaceInFilesDetailed(t *testing.T) {
+	_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/files/replace" {
+			assert.Fail(t, fmt.Sprintf("expected /files/replace, got %s", r.URL.Path))
+		}
+		if r.URL.Query().Get("verbose") != "true" {
+			assert.Fail(t, "expected verbose=true query param")
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(ReplaceResponse{
+			"/tmp/config.txt": {ReplacedCount: 1},
+		})
+	})
+
+	resp, err := client.ReplaceInFilesDetailed(context.Background(), ReplaceRequest{
+		"/tmp/config.txt": {Old: "localhost", New: "production.example.com"},
+	})
+	require.NoErrorf(t, err, "ReplaceInFilesDetailed")
+	if resp == nil {
+		assert.Fail(t, "expected non-nil response")
+	}
+	if resp["/tmp/config.txt"].ReplacedCount != 1 {
+		assert.Fail(t, fmt.Sprintf("expected replacedCount=1, got %d", resp["/tmp/config.txt"].ReplacedCount))
+	}
 }
 
 func TestDownloadFile(t *testing.T) {
@@ -2104,7 +2591,7 @@ func TestCreateSandbox_WithNetworkPolicy(t *testing.T) {
 	})
 
 	_, err := client.CreateSandbox(context.Background(), CreateSandboxRequest{
-		Image:          ImageSpec{URI: "python:3.12"},
+		Image:          &ImageSpec{URI: "python:3.12"},
 		Entrypoint:     []string{"/bin/sh"},
 		ResourceLimits: ResourceLimits{"cpu": "500m"},
 		NetworkPolicy: &NetworkPolicy{
@@ -2159,7 +2646,7 @@ func TestCreateSandbox_WithVolumes(t *testing.T) {
 	})
 
 	_, err := client.CreateSandbox(context.Background(), CreateSandboxRequest{
-		Image:          ImageSpec{URI: "python:3.12"},
+		Image:          &ImageSpec{URI: "python:3.12"},
 		Entrypoint:     []string{"/bin/sh"},
 		ResourceLimits: ResourceLimits{"cpu": "500m"},
 		Volumes: []Volume{

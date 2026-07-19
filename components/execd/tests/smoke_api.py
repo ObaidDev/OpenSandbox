@@ -91,6 +91,58 @@ def fetch_logs(cmd_id: str, cursor: int = 0):
     return r.text, r.headers.get("EXECD-COMMANDS-TAIL-CURSOR")
 
 
+def run_command_blank_lines():
+    """
+    Foreground command whose stdout contains consecutive newlines must surface
+    blank-line events instead of dropping them. Regression test for the
+    readFromPos fix that preserves empty lines (a\n\nb -> ["a", "\n", "b"]).
+    """
+    url = f"{BASE_URL}/command"
+    # Pick a shell-native command per platform so the regression covers both
+    # POSIX (LF-only) and Windows cmd (CRLF) byte streams without depending on
+    # Git for Windows / MSYS argv mangling. The execd reader collapses CRLF to
+    # LF, so both produce ["a", "\n", "b", "\n", "\n", "c"].
+    if os.name == "nt":
+        # cmd /C echo chain: each segment writes "<text>\r\n"; "echo." writes
+        # a bare "\r\n". Order is deterministic because "&" is sequential.
+        command = "echo a&echo.&echo b&echo.&echo.&echo c"
+    else:
+        # printf emits exact bytes: a\n\nb\n\n\nc\n
+        command = "printf 'a\\n\\nb\\n\\n\\nc\\n'"
+    payload = {
+        "command": command,
+        "background": False,
+    }
+
+    stdout_texts = []
+    saw_complete = False
+    with session.post(url, json=payload, stream=True, timeout=15) as resp:
+        expect(resp.status_code == 200, f"SSE start failed: {resp.status_code} {resp.text}")
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            try:
+                if line.startswith(b"data:"):
+                    data = json.loads(line[len(b"data:") :].decode())
+                else:
+                    data = json.loads(line.decode())
+            except Exception:
+                continue
+            event_type = data.get("type")
+            if event_type == "stdout":
+                stdout_texts.append(data.get("text", ""))
+            elif event_type == "execution_complete":
+                saw_complete = True
+                break
+
+    expect(saw_complete, "did not observe execution_complete")
+    want = ["a", "\n", "b", "\n", "\n", "c"]
+    expect(
+        stdout_texts == want,
+        f"blank-line stdout sequence mismatch: got {stdout_texts!r}, want {want!r}",
+    )
+
+
 def sse_disconnect_should_stop_ping():
     """
     Open an SSE stream for a long-running command, receive init, then close the
@@ -172,6 +224,18 @@ def filesystem_smoke():
     info = session.get(f"{BASE_URL}/files/info", params={"path": [file_path]}, timeout=10)
     expect(info.status_code == 200, f"info failed: {info.status_code} {info.text}")
 
+    # list directory contents
+    listed = session.get(f"{BASE_URL}/directories/list", params={"path": sub_dir}, timeout=10)
+    expect(listed.status_code == 200, f"list directory failed: {listed.status_code} {listed.text}")
+    listed_file = None
+    for entry in listed.json():
+        p = entry.get("path")
+        if p and pathlib.Path(p).resolve() == pathlib.Path(file_path).resolve():
+            listed_file = entry
+            break
+    expect(listed_file is not None, "directory list did not find file")
+    expect(listed_file.get("type") == "file", f"directory list file type mismatch: {listed_file}")
+
     # search
     search = session.get(f"{BASE_URL}/files/search", params={"path": base_dir, "pattern": "*.txt"}, timeout=10)
     expect(search.status_code == 200, f"search failed: {search.status_code} {search.text}")
@@ -247,6 +311,9 @@ def main():
 
     sse_disconnect_should_stop_ping()
     print("[+] SSE disconnect handled")
+
+    run_command_blank_lines()
+    print("[+] run_command preserves blank lines")
 
     cmd_id = sse_get_command_id()
     print(f"[+] command id: {cmd_id}")

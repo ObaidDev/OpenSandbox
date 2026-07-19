@@ -671,7 +671,7 @@ public sealed class CodeInterpreterE2ETestFixture : IAsyncLifetime
         {
             ConnectionConfig = _baseFixture.ConnectionConfig,
             Image = _baseFixture.DefaultImage,
-            Entrypoint = new[] { "/opt/opensandbox/code-interpreter.sh" },
+            Entrypoint = new[] { "/opt/code-interpreter/code-interpreter.sh" },
             TimeoutSeconds = _baseFixture.DefaultTimeoutSeconds,
             ReadyTimeoutSeconds = _baseFixture.DefaultReadyTimeoutSeconds,
             Resource = new Dictionary<string, string>
@@ -688,7 +688,7 @@ public sealed class CodeInterpreterE2ETestFixture : IAsyncLifetime
                 ["PYTHON_VERSION"] = "3.12",
                 ["EXECD_LOG_FILE"] = "/tmp/opensandbox-e2e/logs/execd.log",
                 ["EXECD_API_GRACE_SHUTDOWN"] = "3s",
-                ["EXECD_JUPYTER_IDLE_POLL_INTERVAL"] = "1s"
+                ["EXECD_JUPYTER_IDLE_POLL_INTERVAL"] = "200ms"
             },
             Volumes = new[]
             {

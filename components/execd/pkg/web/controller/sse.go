@@ -18,6 +18,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/alibaba/opensandbox/internal/safego"
@@ -36,18 +37,39 @@ var sseHeaders = map[string]string{
 	"X-Accel-Buffering": "no",
 }
 
+// setupSSEResponse is idempotent: once headers are committed, subsequent calls
+// no-op. Callers that need the headers up front (e.g. long-running streaming
+// endpoints with no early-error path) can call it explicitly. Endpoints that
+// may fail synchronously before any event fires should leave header commit to
+// the lazy path inside writeSingleEvent so pre-execution errors can return a
+// proper JSON body instead of a half-formed text/event-stream response.
 func (c *basicController) setupSSEResponse() {
-	for key, value := range sseHeaders {
-		c.ctx.Writer.Header().Set(key, value)
-	}
-	if flusher, ok := c.ctx.Writer.(http.Flusher); ok {
-		flusher.Flush()
-	}
+	c.sseSetupOnce.Do(func() {
+		for key, value := range sseHeaders {
+			c.ctx.Writer.Header().Set(key, value)
+		}
+		if flusher, ok := c.ctx.Writer.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	})
 }
 
 // setServerEventsHandler adapts runtime callbacks to SSE events.
-func (c *CodeInterpretingController) setServerEventsHandler(ctx context.Context) runtime.ExecuteResultHook {
-	return runtime.ExecuteResultHook{
+//
+// It returns the hooks and a cleanup function. The cleanup function blocks
+// until the background ping goroutine has fully stopped. Callers MUST invoke
+// the cleanup function before their handler returns so that no goroutine
+// races against the response-writer close that Go's net/http performs once
+// the handler exits.
+//
+// Typical usage:
+//
+//	hooks, stopSSE := c.setServerEventsHandler(ctx)
+//	defer func() { cancel(); stopSSE() }()
+func (c *CodeInterpretingController) setServerEventsHandler(ctx context.Context) (runtime.ExecuteResultHook, func()) {
+	var pingWg sync.WaitGroup
+
+	hooks := runtime.ExecuteResultHook{
 		OnExecuteInit: func(session string) {
 			event := model.ServerStreamEvent{
 				Type:      model.StreamEventTypeInit,
@@ -57,7 +79,11 @@ func (c *CodeInterpretingController) setServerEventsHandler(ctx context.Context)
 			payload := event.ToJSON()
 			c.writeSingleEvent("OnExecuteInit", payload, true, event.Summary())
 
-			safego.Go(func() { c.ping(ctx) })
+			pingWg.Add(1)
+			safego.Go(func() {
+				defer pingWg.Done()
+				c.ping(ctx)
+			})
 		},
 		OnExecuteResult: func(result map[string]any, count int) {
 			var mutated map[string]any
@@ -150,10 +176,16 @@ func (c *CodeInterpretingController) setServerEventsHandler(ctx context.Context)
 			c.writeSingleEvent("OnExecuteStderr", payload, true, event.Summary())
 		},
 	}
+
+	stopSSE := func() {
+		pingWg.Wait()
+	}
+
+	return hooks, stopSSE
 }
 
 // writeSingleEvent serializes one SSE frame.
-func (c *CodeInterpretingController) writeSingleEvent(handler string, data []byte, verbose bool, summary string) {
+func (c *basicController) writeSingleEvent(handler string, data []byte, verbose bool, summary string) {
 	if c == nil || c.ctx == nil || c.ctx.Writer == nil {
 		return
 	}
@@ -167,6 +199,10 @@ func (c *CodeInterpretingController) writeSingleEvent(handler string, data []byt
 
 	c.chunkWriter.Lock()
 	defer c.chunkWriter.Unlock()
+	// Lazily commit SSE response headers on the first event. This lets the
+	// surrounding handler return a proper JSON error via RespondError if the
+	// runtime fails synchronously before any event fires.
+	c.setupSSEResponse()
 	defer func() {
 		if flusher, ok := c.ctx.Writer.(http.Flusher); ok {
 			flusher.Flush()

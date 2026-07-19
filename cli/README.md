@@ -6,6 +6,7 @@
 - run commands inside a sandbox
 - read and modify sandbox files
 - inspect runtime egress policy
+- manage sandbox-local Credential Vault state
 - collect low-level diagnostics
 - install OpenSandbox-specific skills for coding agents
 
@@ -50,6 +51,7 @@ opensandbox-server
 osb config init
 osb config set connection.domain localhost:8080
 osb config set connection.protocol http
+osb config set connection.api_key <your-api-key>
 osb config show -o json
 ```
 
@@ -147,6 +149,12 @@ osb sandbox create \
   --volumes-file volumes.json
 ```
 
+Create with Credential Vault proxy enabled:
+
+```bash
+osb sandbox create --image python:3.12 --network-policy-file network-policy.json --credential-proxy -o json
+```
+
 ### List and inspect sandboxes
 
 ```bash
@@ -221,16 +229,51 @@ If you are debugging connectivity, verify behavior with an actual command:
 osb command run <sandbox-id> -o raw -- curl -I https://pypi.org
 ```
 
-### Collect diagnostics
+### Manage Credential Vault
 
-These commands are experimental and return plain text.
+Credential Vault operations call the sandbox egress sidecar through the Python SDK.
+Create the sandbox with `--credential-proxy` and an explicit network policy before
+writing vault state.
 
 ```bash
-osb devops summary <sandbox-id> -o raw
+osb credential-vault create <sandbox-id> --file vault.yaml -o json
+osb credential-vault get <sandbox-id> -o json
+osb credential-vault patch <sandbox-id> --file mutation.yaml -o json
+osb credential-vault credential list <sandbox-id> -o json
+osb credential-vault binding list <sandbox-id> -o json
+osb credential-vault delete <sandbox-id> -o json
+```
+
+Use `--file -` to read a JSON/YAML payload from stdin. Do not pass plaintext
+credential values as command-line flags; keep them in the payload stream or file.
+
+### Collect diagnostics
+
+Use the stable diagnostics commands for API-backed log and event descriptors.
+
+```bash
+osb diagnostics events <sandbox-id> --scope lifecycle -o raw
+osb diagnostics events <sandbox-id> --scope runtime -o raw
+osb diagnostics logs <sandbox-id> --scope container -o raw
+osb diagnostics logs <sandbox-id> --scope lifecycle -o json
+osb diagnostics events <sandbox-id> --scope runtime -o json
+osb diagnostics logs <sandbox-id> --scope container -o yaml
+```
+
+`--scope` is required for stable diagnostics. Common scopes are `lifecycle` and
+`container` for logs, and `lifecycle` and `runtime` for events. Raw output
+prints inline diagnostic text, or the content URL when diagnostics are
+delivered as a temporary URL. Structured CLI output follows the SDK/Python field
+style, for example `content_url`, `content_length`, and `expires_at`.
+Some server builds may return `DIAGNOSTICS_NOT_IMPLEMENTED` for scoped
+diagnostics until the stable backend implementation is enabled.
+
+Legacy DevOps diagnostics remain experimental. Prefer `osb diagnostics logs/events`
+for stable API-backed log and event collection.
+
+```bash
 osb devops inspect <sandbox-id> -o raw
-osb devops events <sandbox-id> --limit 100 -o raw
-osb devops logs <sandbox-id> --tail 500 -o raw
-osb devops logs <sandbox-id> --since 30m -o raw
+osb devops summary <sandbox-id> -o raw
 ```
 
 ## Output Formats
@@ -260,7 +303,8 @@ The main command groups are:
 - `osb command`: command execution and persistent sessions
 - `osb file`: file and directory operations
 - `osb egress`: runtime egress policy
-- `osb devops`: experimental diagnostics
+- `osb diagnostics`: stable diagnostics logs and events
+- `osb devops`: experimental legacy diagnostics
 - `osb config`: local CLI configuration
 - `osb skills`: bundled skills for AI tools
 

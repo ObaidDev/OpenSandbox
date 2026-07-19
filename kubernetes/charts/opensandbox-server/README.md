@@ -51,7 +51,18 @@ Optional: override gateway image, replicas, or resources (see `server.gateway.*`
 | `server.gateway.enabled` | When true: set server config to gateway and deploy components/ingress gateway | `false` |
 | `server.gateway.host` | config `gateway.address` (address returned to clients) | `opensandbox.example.com` |
 | `server.gateway.gatewayRouteMode` | server config and gateway route mode (header/uri) | `header` |
+| `server.gateway.env` | Additional environment variables for the ingress-gateway container (e.g. `OTEL_EXPORTER_OTLP_ENDPOINT`) | `[]` |
 | `server.gateway.*` | Gateway image, replicas, port, dataplaneNamespace, providerType, resources | See values.yaml |
+
+Versioning note:
+
+- `server.image.tag` defaults to the chart `appVersion`.
+- The chart package `version` and the image/app `appVersion` are intentionally
+  separate. A server release branch or tag does not automatically imply a new
+  Helm chart package version.
+- If you want the chart to deploy a specific server release, override
+  `server.image.tag` explicitly or consume a Helm package release whose chart
+  version was published for that purpose.
 
 **Gateway**: When `server.gateway.enabled=true`, the chart writes `[ingress] mode = "gateway"` in config.toml and deploys **components/ingress** Deployment/Service/RBAC; gateway `--mode` matches config. External access must be configured separately.
 
@@ -66,5 +77,5 @@ helm uninstall opensandbox-server -n opensandbox-system
 
 ## References
 
-- [OpenSandbox](https://github.com/alibaba/OpenSandbox)
+- [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox)
 - [Helm deployment docs](../../docs/HELM-DEPLOYMENT.md)

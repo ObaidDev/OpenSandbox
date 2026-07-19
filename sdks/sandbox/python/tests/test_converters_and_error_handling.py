@@ -48,6 +48,7 @@ from opensandbox.exceptions import (
 )
 from opensandbox.models.execd import RunCommandOpts
 from opensandbox.models.sandboxes import (
+    CredentialProxyConfig,
     NetworkPolicy,
     NetworkRule,
     PlatformSpec,
@@ -79,6 +80,7 @@ def test_parse_sandbox_error_from_invalid_utf8_bytes_fallback_message() -> None:
 
 def test_handle_api_error_raises_with_parsed_message() -> None:
     class Parsed:
+        code = "BAD_REQUEST"
         message = "bad request"
 
     class Resp:
@@ -90,6 +92,8 @@ def test_handle_api_error_raises_with_parsed_message() -> None:
         handle_api_error(Resp(), "Op")
     assert "bad request" in str(ei.value)
     assert ei.value.request_id == "req-123"
+    assert ei.value.error.code == "BAD_REQUEST"
+    assert ei.value.error.message == "bad request"
 
 
 def test_handle_api_error_noop_on_success() -> None:
@@ -247,6 +251,7 @@ def test_sandbox_model_converter_to_api_create_request_and_renew_tz() -> None:
         ),
         extensions={},
         volumes=None,
+        credential_proxy=CredentialProxyConfig(enabled=True),
     )
     d = req.to_dict()
     assert d["image"]["uri"] == "python:3.11"
@@ -256,6 +261,7 @@ def test_sandbox_model_converter_to_api_create_request_and_renew_tz() -> None:
     assert d["platform"] == {"os": "linux", "arch": "arm64"}
     assert d["networkPolicy"]["defaultAction"] == "deny"
     assert d["networkPolicy"]["egress"] == [{"action": "allow", "target": "pypi.org"}]
+    assert d["credentialProxy"] == {"enabled": True}
 
     renew = SandboxModelConverter.to_api_renew_request(datetime(2025, 1, 1))
     assert renew.expires_at.tzinfo is timezone.utc
@@ -285,9 +291,33 @@ def test_sandbox_model_converter_preserves_null_timeout_for_manual_cleanup() -> 
     assert dumped["timeout"] is None
 
 
+def test_sandbox_model_converter_snapshot_restore_request() -> None:
+    req = SandboxModelConverter.to_api_create_sandbox_request(
+        spec=None,
+        entrypoint=None,
+        env={},
+        metadata={},
+        timeout=None,
+        resource={"cpu": "100m"},
+        platform=None,
+        network_policy=None,
+        extensions={},
+        volumes=None,
+        snapshot_id="snap-123",
+    )
+
+    dumped = req.to_dict()
+    assert dumped["snapshotId"] == "snap-123"
+    assert "image" not in dumped
+    assert "entrypoint" not in dumped
+
+
 def test_sandbox_model_converter_maps_platform_from_create_response() -> None:
     from opensandbox.api.lifecycle.models.create_sandbox_response import (
         CreateSandboxResponse,
+    )
+    from opensandbox.api.lifecycle.models.create_sandbox_response_extensions import (
+        CreateSandboxResponseExtensions,
     )
     from opensandbox.api.lifecycle.models.platform_spec import (
         PlatformSpec as ApiPlatformSpec,
@@ -298,6 +328,9 @@ def test_sandbox_model_converter_maps_platform_from_create_response() -> None:
         id="sbx-1",
         status=SandboxStatus(state="Running"),
         platform=ApiPlatformSpec(os="linux", arch="arm64"),
+        extensions=CreateSandboxResponseExtensions.from_dict(
+            {"opensandbox.extensions.custom-label": "中文数据"}
+        ),
         created_at=datetime(2025, 1, 1),
         entrypoint=["/bin/sh"],
     )
@@ -305,6 +338,23 @@ def test_sandbox_model_converter_maps_platform_from_create_response() -> None:
     converted = SandboxModelConverter.to_sandbox_create_response(api_response)
     assert converted.platform is not None
     assert converted.platform.arch == "arm64"
+    assert converted.extensions == {"opensandbox.extensions.custom-label": "中文数据"}
+
+
+def test_sandbox_model_converter_preserves_missing_metadata_default() -> None:
+    from opensandbox.api.lifecycle.models.sandbox import Sandbox
+    from opensandbox.api.lifecycle.models.sandbox_status import SandboxStatus
+
+    api_sandbox = Sandbox(
+        id="sbx-1",
+        status=SandboxStatus(state="Running"),
+        created_at=datetime(2025, 1, 1),
+        entrypoint=["/bin/sh"],
+    )
+
+    converted = SandboxModelConverter.to_sandbox_info(api_sandbox)
+    assert converted.metadata == {}
+    assert converted.extensions is None
 
 
 def test_sandbox_model_converter_supports_windows_platform_request() -> None:

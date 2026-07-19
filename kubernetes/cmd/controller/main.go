@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -40,10 +41,17 @@ import (
 
 	sandboxv1alpha1 "github.com/alibaba/OpenSandbox/sandbox-k8s/apis/sandbox/v1alpha1"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/controller"
+	poolassign "github.com/alibaba/OpenSandbox/sandbox-k8s/internal/controller/poolassign"
 	cryptoutil "github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/crypto"
+	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/expectations"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/fieldindex"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/logging"
 	// +kubebuilder:scaffold:imports
+)
+
+var (
+	commitID  = "unknown"
+	buildDate = "unknown"
 )
 
 const (
@@ -192,6 +200,32 @@ func main() {
 		"Available controllers: batchsandbox, pool. "+
 		"Example: --concurrency='batchsandbox=32;pool=128'")
 
+	// Image committer
+	var imageCommitterImage string
+	flag.StringVar(&imageCommitterImage, "image-committer-image", "image-committer:dev", "The image used for commit operations (contains nerdctl tool).")
+
+	var containerdSocketPath string
+	flag.StringVar(&containerdSocketPath, "containerd-socket-path", controller.ContainerdSocketPath, "Containerd socket path")
+
+	// Commit job timeout
+	var commitJobTimeout time.Duration
+	flag.DurationVar(&commitJobTimeout, "commit-job-timeout", 10*time.Minute, "The timeout duration for commit jobs.")
+
+	var snapshotRegistry string
+	flag.StringVar(&snapshotRegistry, "snapshot-registry", "", "OCI registry for snapshot images (e.g., registry.example.com/snapshots).")
+
+	var snapshotRegistryInsecure bool
+	flag.BoolVar(&snapshotRegistryInsecure, "snapshot-registry-insecure", false, "Use insecure registry mode when pushing snapshot images.")
+
+	var snapshotPushSecret string
+	flag.StringVar(&snapshotPushSecret, "snapshot-push-secret", "", "K8s Secret name for pushing snapshots to registry.")
+
+	var imageCommitterPullSecret string
+	flag.StringVar(&imageCommitterPullSecret, "image-committer-pull-secret", "", "K8s Secret name for pulling the image-committer image in commit Jobs. Required when imageCommitterImage is in a private registry.")
+
+	var resumePullSecret string
+	flag.StringVar(&resumePullSecret, "resume-pull-secret", "", "K8s Secret name for pulling snapshot images during resume.")
+
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
 
@@ -211,6 +245,8 @@ func main() {
 
 	logger := logging.NewLoggerWithZapOptions(logOpts)
 	ctrl.SetLogger(logger)
+
+	setupLog.Info("Starting controller", "commitID", commitID, "buildDate", buildDate)
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -350,11 +386,12 @@ func main() {
 	}
 
 	config := ctrl.GetConfigOrDie()
+	config.UserAgent = "sandbox-k8s-controller/1.0"
 	// Set client rate limiter if specified
-	if kubeClientQPS > 0 {
+	if kubeClientQPS != 0 {
 		config.QPS = float32(kubeClientQPS)
 	}
-	if kubeClientBurst > 0 {
+	if kubeClientBurst != 0 {
 		config.Burst = kubeClientBurst
 	}
 
@@ -365,17 +402,11 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "2fa1c467.opensandbox.io",
-		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
-		// when the Manager ends. This requires the binary to immediately end when the
-		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
-		// speeds up voluntary leader transitions as the new leader don't have to wait
-		// LeaseDuration time first.
-		//
-		// In the default scaffold provided, the program ends immediately after
-		// the manager stops, so would be fine to enable this option. However,
-		// if you are doing or is intended to do any operation such as perform cleanups
-		// after the manager stops then its usage might be unsafe.
-		// LeaderElectionReleaseOnCancel: true,
+		// LeaderElectionReleaseOnCancel causes the leader to voluntarily release the lease
+		// when the Manager is stopped, allowing a new leader to acquire it without waiting
+		// for the full LeaseDuration. This is safe because main() exits immediately after
+		// mgr.Start() returns and performs no post-stop cleanup.
+		LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -395,21 +426,47 @@ func main() {
 	poolConcurrency := concurrencyConfig.Get(poolKindName, defaultPoolConcurrency)
 	setupLog.Info("controller concurrency configured", batchSandboxKindName, batchSandboxConcurrency, poolKindName, poolConcurrency)
 
+	profileStore := poolassign.NewProfileStore()
+	_ = profileStore.LoadDefault()
+	if err := profileStore.SetupWithManager(mgr, os.Getenv("POD_NAMESPACE")); err != nil {
+		setupLog.Error(err, "failed to setup pool assign profiles ConfigMap watch")
+		os.Exit(1)
+	}
+
 	if err := (&controller.BatchSandboxReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("batchsandbox-controller"),
+		Client:              mgr.GetClient(),
+		Scheme:              mgr.GetScheme(),
+		Recorder:            mgr.GetEventRecorderFor("batchsandbox-controller"),
+		ResumePullSecret:    resumePullSecret,
+		ProfileStore:        profileStore,
+		StatusRVExpectation: expectations.NewResourceVersionExpectation(),
 	}).SetupWithManager(mgr, batchSandboxConcurrency); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "BatchSandbox")
 		os.Exit(1)
 	}
 	if err := (&controller.PoolReconciler{
-		Client:    mgr.GetClient(),
-		Scheme:    mgr.GetScheme(),
-		Recorder:  mgr.GetEventRecorderFor("pool-controller"),
-		Allocator: controller.NewDefaultAllocator(mgr.GetClient()),
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		Recorder:   mgr.GetEventRecorderFor("pool-controller"),
+		Allocator:  controller.NewDefaultAllocator(mgr.GetClient()),
+		RestConfig: mgr.GetConfig(),
 	}).SetupWithManager(mgr, poolConcurrency); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Pool")
+		os.Exit(1)
+	}
+	if err := (&controller.SandboxSnapshotReconciler{
+		Client:                   mgr.GetClient(),
+		Scheme:                   mgr.GetScheme(),
+		Recorder:                 mgr.GetEventRecorderFor("sandboxsnapshot-controller"),
+		ImageCommitterImage:      imageCommitterImage,
+		ContainerdSocketPath:     containerdSocketPath,
+		CommitJobTimeout:         commitJobTimeout,
+		SnapshotRegistry:         snapshotRegistry,
+		SnapshotRegistryInsecure: snapshotRegistryInsecure,
+		SnapshotPushSecret:       snapshotPushSecret,
+		ImageCommitterPullSecret: imageCommitterPullSecret,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "SandboxSnapshot")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder

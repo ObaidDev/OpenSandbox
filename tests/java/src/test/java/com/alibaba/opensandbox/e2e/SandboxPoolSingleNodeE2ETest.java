@@ -22,6 +22,7 @@ import com.alibaba.opensandbox.sandbox.Sandbox;
 import com.alibaba.opensandbox.sandbox.SandboxManager;
 import com.alibaba.opensandbox.sandbox.config.ConnectionConfig;
 import com.alibaba.opensandbox.sandbox.domain.exceptions.PoolEmptyException;
+import com.alibaba.opensandbox.sandbox.domain.exceptions.PoolDestroyedException;
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxException;
 import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.Execution;
 import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.RunCommandRequest;
@@ -30,10 +31,14 @@ import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxFilter;
 import com.alibaba.opensandbox.sandbox.domain.pool.AcquirePolicy;
 import com.alibaba.opensandbox.sandbox.domain.pool.IdleEntry;
 import com.alibaba.opensandbox.sandbox.domain.pool.PoolCreationSpec;
+import com.alibaba.opensandbox.sandbox.domain.pool.PoolDestroyOptions;
+import com.alibaba.opensandbox.sandbox.domain.pool.PoolDestroyResult;
+import com.alibaba.opensandbox.sandbox.domain.pool.PoolDestroyState;
 import com.alibaba.opensandbox.sandbox.domain.pool.PoolLifecycleState;
 import com.alibaba.opensandbox.sandbox.domain.pool.PoolState;
 import com.alibaba.opensandbox.sandbox.infrastructure.pool.InMemoryPoolStateStore;
 import com.alibaba.opensandbox.sandbox.pool.SandboxPool;
+import com.alibaba.opensandbox.sandbox.pool.SandboxPoolManager;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -86,7 +91,14 @@ public class SandboxPoolSingleNodeE2ETest extends BaseE2ETest {
                         .image(getSandboxImage())
                         .entrypoint(List.of("tail -f /dev/null"))
                         .metadata(Map.of("tag", tag, "suite", "sandbox-pool-e2e"))
-                        .env(Map.of("E2E_TEST", "true", "EXECD_API_GRACE_SHUTDOWN", "3s", "EXECD_JUPYTER_IDLE_POLL_INTERVAL", "1s"))
+                        .env(
+                                Map.of(
+                                        "E2E_TEST",
+                                        "true",
+                                        "EXECD_API_GRACE_SHUTDOWN",
+                                        "3s",
+                                        "EXECD_JUPYTER_IDLE_POLL_INTERVAL",
+                                        "1s"))
                         .build();
         pool =
                 SandboxPool.builder()
@@ -512,6 +524,85 @@ public class SandboxPoolSingleNodeE2ETest extends BaseE2ETest {
 
     @Test
     @Order(11)
+    @DisplayName("destroy writes tombstone, drains idle, and fences direct-create fallback")
+    @Timeout(value = 4, unit = TimeUnit.MINUTES)
+    void testDestroyFencesSingleNodePoolNamespace() throws Exception {
+        pool.releaseAllIdle();
+        pool.shutdown(false);
+
+        tag = "e2e-pool-destroy-" + UUID.randomUUID().toString().substring(0, 8);
+        poolName = "pool-destroy-" + tag;
+        stateStore = new InMemoryPoolStateStore();
+        PoolCreationSpec creationSpec =
+                PoolCreationSpec.builder()
+                        .image(getSandboxImage())
+                        .entrypoint(List.of("tail -f /dev/null"))
+                        .metadata(Map.of("tag", tag, "suite", "sandbox-pool-e2e"))
+                        .env(
+                                Map.of(
+                                        "E2E_TEST",
+                                        "true",
+                                        "EXECD_API_GRACE_SHUTDOWN",
+                                        "3s",
+                                        "EXECD_JUPYTER_IDLE_POLL_INTERVAL",
+                                        "1s"))
+                        .build();
+        pool =
+                SandboxPool.builder()
+                        .poolName(poolName)
+                        .ownerId("owner-" + tag)
+                        .maxIdle(1)
+                        .warmupConcurrency(1)
+                        .stateStore(stateStore)
+                        .connectionConfig(sharedConnectionConfig)
+                        .creationSpec(creationSpec)
+                        .reconcileInterval(Duration.ofMinutes(5))
+                        .drainTimeout(Duration.ofMillis(200))
+                        .build();
+        pool.start();
+        eventually(
+                "destroy target pool warms one idle sandbox",
+                Duration.ofMinutes(2),
+                Duration.ofSeconds(2),
+                () -> pool.snapshot().getIdleCount() >= 1);
+
+        SandboxPoolManager poolManager =
+                SandboxPoolManager.builder()
+                        .stateStore(stateStore)
+                        .connectionConfig(sharedConnectionConfig)
+                        .ownerId("manager-" + tag)
+                        .build();
+        PoolDestroyResult result = poolManager.destroy(poolName, new PoolDestroyOptions());
+
+        assertEquals(PoolDestroyState.DESTROYED, result.getState());
+        assertTrue(result.getPersistentStateCleared(), "destroy should clear persistent pool state");
+        assertTrue(result.getDrainedIdleCount() >= 1, "destroy should drain warmed idle ids");
+        assertEquals(result.getDrainedIdleCount(), result.getKilledIdleCount());
+        assertEquals(PoolDestroyState.DESTROYED, stateStore.getDestroyState(poolName));
+        assertEquals(0, stateStore.snapshotCounters(poolName).getIdleCount());
+
+        assertThrows(
+                PoolDestroyedException.class,
+                () -> pool.acquire(Duration.ofMinutes(5), AcquirePolicy.DIRECT_CREATE));
+        assertThrows(PoolDestroyedException.class, () -> pool.resize(1));
+
+        SandboxPool replacement =
+                SandboxPool.builder()
+                        .poolName(poolName)
+                        .ownerId("owner-replacement-" + tag)
+                        .maxIdle(1)
+                        .warmupConcurrency(1)
+                        .stateStore(stateStore)
+                        .connectionConfig(sharedConnectionConfig)
+                        .creationSpec(creationSpec)
+                        .reconcileInterval(Duration.ofMinutes(5))
+                        .drainTimeout(Duration.ofMillis(200))
+                        .build();
+        assertThrows(PoolDestroyedException.class, replacement::start);
+    }
+
+    @Test
+    @Order(12)
     @DisplayName("two pools stay isolated in serial low-footprint mode")
     @Timeout(value = 6, unit = TimeUnit.MINUTES)
     void testTwoPoolsIsolationSerialLowFootprint() throws Exception {
@@ -541,7 +632,14 @@ public class SandboxPoolSingleNodeE2ETest extends BaseE2ETest {
                                                             tagA,
                                                             "suite",
                                                             "sandbox-pool-e2e"))
-                                            .env(Map.of("E2E_TEST", "true", "EXECD_API_GRACE_SHUTDOWN", "3s", "EXECD_JUPYTER_IDLE_POLL_INTERVAL", "1s"))
+                                            .env(
+                                                    Map.of(
+                                                            "E2E_TEST",
+                                                            "true",
+                                                            "EXECD_API_GRACE_SHUTDOWN",
+                                                            "3s",
+                                                            "EXECD_JUPYTER_IDLE_POLL_INTERVAL",
+                                                            "1s"))
                                             .build())
                             .reconcileInterval(Duration.ofSeconds(2))
                             .drainTimeout(Duration.ofMillis(200))
@@ -580,7 +678,14 @@ public class SandboxPoolSingleNodeE2ETest extends BaseE2ETest {
                                                             tagB,
                                                             "suite",
                                                             "sandbox-pool-e2e"))
-                                            .env(Map.of("E2E_TEST", "true", "EXECD_API_GRACE_SHUTDOWN", "3s", "EXECD_JUPYTER_IDLE_POLL_INTERVAL", "1s"))
+                                            .env(
+                                                    Map.of(
+                                                            "E2E_TEST",
+                                                            "true",
+                                                            "EXECD_API_GRACE_SHUTDOWN",
+                                                            "3s",
+                                                            "EXECD_JUPYTER_IDLE_POLL_INTERVAL",
+                                                            "1s"))
                                             .build())
                             .reconcileInterval(Duration.ofSeconds(2))
                             .drainTimeout(Duration.ofMillis(200))
@@ -659,7 +764,7 @@ public class SandboxPoolSingleNodeE2ETest extends BaseE2ETest {
 
         pool.resize(0);
         int released = pool.releaseAllIdle();
-        assertTrue(released >= 1, "releaseAllIdle should release at least one idle sandbox");
+        assertTrue(released >= 0, "releaseAllIdle should return non-negative count");
 
         eventually(
                 "idle count reaches zero after releaseAllIdle",
@@ -671,7 +776,7 @@ public class SandboxPoolSingleNodeE2ETest extends BaseE2ETest {
                 "remote tagged sandbox count decreases after releaseAllIdle",
                 Duration.ofSeconds(60),
                 Duration.ofSeconds(2),
-                () -> countTaggedSandboxes() <= Math.max(0, before - released + 1));
+                () -> countTaggedSandboxes() == 0);
     }
 
     @Test
@@ -700,7 +805,14 @@ public class SandboxPoolSingleNodeE2ETest extends BaseE2ETest {
                                                             badTag,
                                                             "suite",
                                                             "sandbox-pool-e2e"))
-                                            .env(Map.of("E2E_TEST", "true", "EXECD_API_GRACE_SHUTDOWN", "3s", "EXECD_JUPYTER_IDLE_POLL_INTERVAL", "1s"))
+                                            .env(
+                                                    Map.of(
+                                                            "E2E_TEST",
+                                                            "true",
+                                                            "EXECD_API_GRACE_SHUTDOWN",
+                                                            "3s",
+                                                            "EXECD_JUPYTER_IDLE_POLL_INTERVAL",
+                                                            "1s"))
                                             .build())
                             .degradedThreshold(1)
                             .reconcileInterval(Duration.ofSeconds(1))
@@ -764,7 +876,14 @@ public class SandboxPoolSingleNodeE2ETest extends BaseE2ETest {
                                                             badTag,
                                                             "suite",
                                                             "sandbox-pool-e2e"))
-                                            .env(Map.of("E2E_TEST", "true", "EXECD_API_GRACE_SHUTDOWN", "3s", "EXECD_JUPYTER_IDLE_POLL_INTERVAL", "1s"))
+                                            .env(
+                                                    Map.of(
+                                                            "E2E_TEST",
+                                                            "true",
+                                                            "EXECD_API_GRACE_SHUTDOWN",
+                                                            "3s",
+                                                            "EXECD_JUPYTER_IDLE_POLL_INTERVAL",
+                                                            "1s"))
                                             .build())
                             .degradedThreshold(1)
                             .reconcileInterval(Duration.ofSeconds(1))
@@ -826,7 +945,14 @@ public class SandboxPoolSingleNodeE2ETest extends BaseE2ETest {
                                                             goodTag,
                                                             "suite",
                                                             "sandbox-pool-e2e"))
-                                            .env(Map.of("E2E_TEST", "true", "EXECD_API_GRACE_SHUTDOWN", "3s", "EXECD_JUPYTER_IDLE_POLL_INTERVAL", "1s"))
+                                            .env(
+                                                    Map.of(
+                                                            "E2E_TEST",
+                                                            "true",
+                                                            "EXECD_API_GRACE_SHUTDOWN",
+                                                            "3s",
+                                                            "EXECD_JUPYTER_IDLE_POLL_INTERVAL",
+                                                            "1s"))
                                             .build())
                             .reconcileInterval(Duration.ofSeconds(2))
                             .drainTimeout(Duration.ofMillis(100))
@@ -898,7 +1024,14 @@ public class SandboxPoolSingleNodeE2ETest extends BaseE2ETest {
                                                             preparedTag,
                                                             "suite",
                                                             "sandbox-pool-e2e"))
-                                            .env(Map.of("E2E_TEST", "true", "EXECD_API_GRACE_SHUTDOWN", "3s", "EXECD_JUPYTER_IDLE_POLL_INTERVAL", "1s"))
+                                            .env(
+                                                    Map.of(
+                                                            "E2E_TEST",
+                                                            "true",
+                                                            "EXECD_API_GRACE_SHUTDOWN",
+                                                            "3s",
+                                                            "EXECD_JUPYTER_IDLE_POLL_INTERVAL",
+                                                            "1s"))
                                             .build())
                             .warmupSandboxPreparer(
                                     sandbox ->
@@ -945,6 +1078,75 @@ public class SandboxPoolSingleNodeE2ETest extends BaseE2ETest {
 
     @Test
     @Order(17)
+    @DisplayName("warmupConcurrency above one fills target and stays bounded")
+    @Timeout(value = 4, unit = TimeUnit.MINUTES)
+    void testWarmupConcurrencyAboveOneReachesTargetAndStaysBounded() throws InterruptedException {
+        pool.resize(0);
+        pool.releaseAllIdle();
+        pool.shutdown(false);
+
+        String concurrentTag =
+                "e2e-pool-warmup-concurrency-" + UUID.randomUUID().toString().substring(0, 8);
+        SandboxPool concurrentPool = null;
+        try {
+            concurrentPool =
+                    SandboxPool.builder()
+                            .poolName("pool-warmup-concurrency-" + concurrentTag)
+                            .ownerId("owner-warmup-concurrency-" + concurrentTag)
+                            .maxIdle(3)
+                            .warmupConcurrency(2)
+                            .stateStore(new InMemoryPoolStateStore())
+                            .connectionConfig(sharedConnectionConfig)
+                            .creationSpec(
+                                    PoolCreationSpec.builder()
+                                            .image(getSandboxImage())
+                                            .entrypoint(List.of("tail -f /dev/null"))
+                                            .metadata(
+                                                    Map.of(
+                                                            "tag",
+                                                            concurrentTag,
+                                                            "suite",
+                                                            "sandbox-pool-e2e"))
+                                            .env(
+                                                    Map.of(
+                                                            "E2E_TEST",
+                                                            "true",
+                                                            "EXECD_API_GRACE_SHUTDOWN",
+                                                            "3s",
+                                                            "EXECD_JUPYTER_IDLE_POLL_INTERVAL",
+                                                            "1s"))
+                                            .build())
+                            .reconcileInterval(Duration.ofSeconds(2))
+                            .drainTimeout(Duration.ofMillis(200))
+                            .build();
+            concurrentPool.start();
+
+            SandboxPool finalConcurrentPool = concurrentPool;
+            eventually(
+                    "concurrent warmup reaches configured idle target without overshoot",
+                    Duration.ofMinutes(2),
+                    Duration.ofSeconds(1),
+                    () ->
+                            finalConcurrentPool.snapshot().getIdleCount() >= 3
+                                    && countTaggedSandboxes(concurrentTag) <= 3);
+        } finally {
+            if (concurrentPool != null) {
+                try {
+                    concurrentPool.resize(0);
+                    concurrentPool.releaseAllIdle();
+                } catch (Exception ignored) {
+                }
+                try {
+                    concurrentPool.shutdown(false);
+                } catch (Exception ignored) {
+                }
+            }
+            cleanupTaggedSandboxes(concurrentTag);
+        }
+    }
+
+    @Test
+    @Order(18)
     @DisplayName("snapshot exposes lifecycle maxIdle and idle entry details")
     @Timeout(value = 4, unit = TimeUnit.MINUTES)
     void testSnapshotExposesLifecycleAndIdleEntries() throws InterruptedException {

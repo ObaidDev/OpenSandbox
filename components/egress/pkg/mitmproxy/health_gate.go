@@ -15,8 +15,10 @@
 package mitmproxy
 
 import (
+	"context"
 	"os"
 	"sync/atomic"
+	"time"
 
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
 )
@@ -37,8 +39,12 @@ func NewHealthGate() *HealthGate {
 }
 
 func (g *HealthGate) MarkStackReady() {
+	g.SetReady(true)
+}
+
+func (g *HealthGate) SetReady(v bool) {
 	if g != nil {
-		g.ready.Store(true)
+		g.ready.Store(v)
 	}
 }
 
@@ -47,4 +53,19 @@ func (g *HealthGate) MitmPending() bool {
 		return false
 	}
 	return g.required && !g.ready.Load()
+}
+
+// WaitReady polls until the gate is ready, ctx is cancelled, or 30s elapses.
+func (g *HealthGate) WaitReady(ctx context.Context) bool {
+	deadline := time.After(30 * time.Second)
+	for g.MitmPending() {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-deadline:
+			return false
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	return true
 }

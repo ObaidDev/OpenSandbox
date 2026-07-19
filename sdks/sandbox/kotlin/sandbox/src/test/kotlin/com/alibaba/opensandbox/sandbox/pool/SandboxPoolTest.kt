@@ -22,15 +22,21 @@ import com.alibaba.opensandbox.sandbox.config.ConnectionConfig
 import com.alibaba.opensandbox.sandbox.domain.exceptions.PoolAcquireFailedException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.PoolEmptyException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.PoolNotRunningException
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.CredentialProxyConfig
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.Host
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkPolicy
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.NetworkRule
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PlatformSpec
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.Volume
 import com.alibaba.opensandbox.sandbox.domain.pool.AcquirePolicy
+import com.alibaba.opensandbox.sandbox.domain.pool.IdleEntry
 import com.alibaba.opensandbox.sandbox.domain.pool.PoolCreationSpec
 import com.alibaba.opensandbox.sandbox.domain.pool.PoolLifecycleState
 import com.alibaba.opensandbox.sandbox.domain.pool.PoolState
+import com.alibaba.opensandbox.sandbox.domain.pool.PoolStateStore
+import com.alibaba.opensandbox.sandbox.domain.pool.PooledSandboxCreator
 import com.alibaba.opensandbox.sandbox.domain.pool.SandboxPreparer
+import com.alibaba.opensandbox.sandbox.domain.pool.StoreCounters
 import com.alibaba.opensandbox.sandbox.infrastructure.pool.InMemoryPoolStateStore
 import io.mockk.every
 import io.mockk.just
@@ -43,6 +49,7 @@ import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import java.time.Duration
+import java.time.Instant
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
@@ -122,6 +129,41 @@ class SandboxPoolTest {
         val snap = pool.snapshot()
         assertEquals(PoolState.STOPPED, snap.state)
         assertEquals(PoolLifecycleState.STOPPED, snap.lifecycleState)
+    }
+
+    @Test
+    fun `shutdown graceful releases primary lock best effort`() {
+        val store = RecordingPoolStateStore()
+        val pool = buildPool(store = store, maxIdle = 0)
+
+        pool.start()
+        pool.shutdown(graceful = true)
+
+        assertEquals(listOf("test-pool" to "test-owner"), store.releasedLocks)
+    }
+
+    @Test
+    fun `shutdown non-graceful releases primary lock best effort`() {
+        val store = RecordingPoolStateStore()
+        val pool = buildPool(store = store, maxIdle = 0)
+
+        pool.start()
+        pool.shutdown(graceful = false)
+
+        assertEquals(listOf("test-pool" to "test-owner"), store.releasedLocks)
+    }
+
+    @Test
+    fun `shutdown completes when primary lock release fails`() {
+        val store = RecordingPoolStateStore(releaseFails = true)
+        val pool = buildPool(store = store, maxIdle = 0)
+
+        pool.start()
+        pool.shutdown(graceful = true)
+
+        val snap = pool.snapshot()
+        assertEquals(PoolLifecycleState.STOPPED, snap.lifecycleState)
+        assertEquals(listOf("test-pool" to "test-owner"), store.releasedLocks)
     }
 
     @Test
@@ -346,6 +388,42 @@ class SandboxPoolTest {
     }
 
     @Test
+    fun `applyToBuilder propagates pool creation spec platform to sandbox builder`() {
+        val platform =
+            PlatformSpec.builder()
+                .os("linux")
+                .arch("arm64")
+                .build()
+        val spec =
+            PoolCreationSpec.builder()
+                .image("ubuntu:22.04")
+                .platform(platform)
+                .build()
+
+        val builder = spec.applyToBuilder(Sandbox.builder())
+
+        val platformField = builder.javaClass.getDeclaredField("platform")
+        platformField.isAccessible = true
+        assertSame(platform, platformField.get(builder))
+    }
+
+    @Test
+    fun `applyToBuilder propagates pool creation spec credential proxy to sandbox builder`() {
+        val credentialProxy = CredentialProxyConfig.enabled()
+        val spec =
+            PoolCreationSpec.builder()
+                .image("ubuntu:22.04")
+                .credentialProxy(credentialProxy)
+                .build()
+
+        val builder = spec.applyToBuilder(Sandbox.builder())
+
+        val credentialProxyField = builder.javaClass.getDeclaredField("credentialProxy")
+        credentialProxyField.isAccessible = true
+        assertSame(credentialProxy, credentialProxyField.get(builder))
+    }
+
+    @Test
     fun `pool creation spec builder convenience methods align with sandbox builder semantics`() {
         val volume =
             Volume.builder()
@@ -426,6 +504,7 @@ class SandboxPoolTest {
     @Test
     fun `sandbox pool builder forwards acquire readiness settings into config`() {
         val healthCheck: (Sandbox) -> Boolean = { true }
+        val sandboxCreator = PooledSandboxCreator { mockk<Sandbox>() }
         val pool =
             SandboxPool.builder()
                 .poolName("test-pool")
@@ -438,6 +517,8 @@ class SandboxPoolTest {
                 .acquireHealthCheckPollingInterval(Duration.ofMillis(50))
                 .acquireHealthCheck(healthCheck)
                 .acquireSkipHealthCheck()
+                .acquireMinRemainingTtl(Duration.ofSeconds(90))
+                .sandboxCreator(sandboxCreator)
                 .idleTimeout(Duration.ofMinutes(15))
                 .build()
 
@@ -449,6 +530,8 @@ class SandboxPoolTest {
         assertEquals(Duration.ofMillis(50), config.acquireHealthCheckPollingInterval)
         assertSame(healthCheck, config.acquireHealthCheck)
         assertEquals(true, config.acquireSkipHealthCheck)
+        assertEquals(Duration.ofSeconds(90), config.acquireMinRemainingTtl)
+        assertSame(sandboxCreator, config.sandboxCreator)
         assertEquals(Duration.ofMinutes(15), config.idleTimeout)
     }
 
@@ -478,14 +561,65 @@ class SandboxPoolTest {
         }
     }
 
-    private fun buildPool(): SandboxPool {
+    @Test
+    fun `start overwrites shared maxIdle with user config`() {
+        val store = RecordingPoolStateStore(initialMaxIdle = 0)
+        val pool = buildPool(store = store, maxIdle = 3)
+
+        pool.start()
+        try {
+            assertEquals(3, store.maxIdleByPool["test-pool"])
+            assertEquals(listOf("test-pool" to 3), store.setMaxIdleCalls)
+            assertEquals(3, pool.snapshot().maxIdle)
+        } finally {
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    @Test
+    fun `custom direct create kills and closes when renew fails`() {
+        val sandbox = mockk<Sandbox>()
+        every { sandbox.renew(Duration.ofMinutes(5)) } throws RuntimeException("renew failed")
+        every { sandbox.kill() } just runs
+        every { sandbox.close() } just runs
+
+        val pool =
+            SandboxPool.builder()
+                .poolName("test-pool")
+                .ownerId("test-owner")
+                .maxIdle(0)
+                .stateStore(InMemoryPoolStateStore())
+                .connectionConfig(ConnectionConfig.builder().build())
+                .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                .sandboxCreator(PooledSandboxCreator { sandbox })
+                .drainTimeout(Duration.ofMillis(50))
+                .reconcileInterval(Duration.ofSeconds(30))
+                .build()
+        pool.start()
+
+        try {
+            assertThrows(RuntimeException::class.java) {
+                pool.acquire(Duration.ofMinutes(5))
+            }
+
+            verify(exactly = 1) { sandbox.kill() }
+            verify(exactly = 1) { sandbox.close() }
+        } finally {
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    private fun buildPool(
+        store: PoolStateStore = InMemoryPoolStateStore(),
+        maxIdle: Int = 2,
+    ): SandboxPool {
         val config = ConnectionConfig.builder().build()
         val spec = PoolCreationSpec.builder().image("ubuntu:22.04").build()
         return SandboxPool.builder()
             .poolName("test-pool")
             .ownerId("test-owner")
-            .maxIdle(2)
-            .stateStore(InMemoryPoolStateStore())
+            .maxIdle(maxIdle)
+            .stateStore(store)
             .connectionConfig(config)
             .creationSpec(spec)
             .drainTimeout(Duration.ofMillis(50))
@@ -501,5 +635,76 @@ class SandboxPoolTest {
         val field = target.javaClass.getDeclaredField(fieldName)
         field.isAccessible = true
         field.set(target, value)
+    }
+
+    private class RecordingPoolStateStore(
+        private val releaseFails: Boolean = false,
+        initialMaxIdle: Int? = null,
+    ) : PoolStateStore {
+        val releasedLocks = mutableListOf<Pair<String, String>>()
+        val setMaxIdleCalls = mutableListOf<Pair<String, Int>>()
+        val maxIdleByPool = mutableMapOf<String, Int>()
+
+        init {
+            if (initialMaxIdle != null) {
+                maxIdleByPool["test-pool"] = initialMaxIdle
+            }
+        }
+
+        override fun tryTakeIdle(poolName: String): String? = null
+
+        override fun putIdle(
+            poolName: String,
+            sandboxId: String,
+        ) {
+        }
+
+        override fun removeIdle(
+            poolName: String,
+            sandboxId: String,
+        ) {
+        }
+
+        override fun tryAcquirePrimaryLock(
+            poolName: String,
+            ownerId: String,
+            ttl: Duration,
+        ): Boolean = true
+
+        override fun renewPrimaryLock(
+            poolName: String,
+            ownerId: String,
+            ttl: Duration,
+        ): Boolean = true
+
+        override fun releasePrimaryLock(
+            poolName: String,
+            ownerId: String,
+        ) {
+            releasedLocks += poolName to ownerId
+            if (releaseFails) {
+                throw RuntimeException("release failed")
+            }
+        }
+
+        override fun reapExpiredIdle(
+            poolName: String,
+            now: Instant,
+        ) {
+        }
+
+        override fun snapshotCounters(poolName: String): StoreCounters = StoreCounters(idleCount = 0)
+
+        override fun snapshotIdleEntries(poolName: String): List<IdleEntry> = emptyList()
+
+        override fun getMaxIdle(poolName: String): Int? = maxIdleByPool[poolName]
+
+        override fun setMaxIdle(
+            poolName: String,
+            maxIdle: Int,
+        ) {
+            setMaxIdleCalls += poolName to maxIdle
+            maxIdleByPool[poolName] = maxIdle
+        }
     }
 }

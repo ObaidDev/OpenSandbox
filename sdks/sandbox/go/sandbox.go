@@ -27,6 +27,8 @@ import (
 type SandboxCreateOptions struct {
 	// Image is the container image URI (required).
 	Image string
+	// SnapshotID restores the sandbox from a previously created snapshot.
+	SnapshotID string
 
 	// Entrypoint is the command to run. Defaults to DefaultEntrypoint.
 	Entrypoint []string
@@ -34,6 +36,11 @@ type SandboxCreateOptions struct {
 	// Resource limits (e.g. {"cpu": "500m", "memory": "256Mi"}).
 	// Defaults to DefaultResourceLimits.
 	ResourceLimits ResourceLimits
+
+	// ResourceRequests sets Kubernetes resource requests (guaranteed minimums).
+	// When set, enables Burstable QoS (requests < limits).
+	// When nil, limits are used for both limits and requests (Guaranteed QoS).
+	ResourceRequests ResourceLimits
 
 	// TimeoutSeconds is the sandbox TTL. Nil means use DefaultTimeoutSeconds.
 	TimeoutSeconds *int
@@ -50,6 +57,9 @@ type SandboxCreateOptions struct {
 	// NetworkPolicy for egress control.
 	NetworkPolicy *NetworkPolicy
 
+	// CredentialProxy enables Credential Vault transparent proxy support.
+	CredentialProxy *CredentialProxyConfig
+
 	// Volumes to mount.
 	Volumes []Volume
 
@@ -63,6 +73,10 @@ type SandboxCreateOptions struct {
 
 	// Extensions for provider-specific parameters.
 	Extensions map[string]string
+
+	// Platform selects the target OS/arch for the sandbox (e.g. {"os":
+	// "windows", "arch": "amd64"}). When nil the server applies its default.
+	Platform *PlatformSpec
 
 	// SkipHealthCheck skips the WaitUntilReady call after creation.
 	SkipHealthCheck bool
@@ -94,8 +108,8 @@ func (s *Sandbox) ID() string { return s.id }
 
 // CreateSandbox creates a new sandbox and waits for it to be ready.
 func CreateSandbox(ctx context.Context, config ConnectionConfig, opts SandboxCreateOptions) (*Sandbox, error) {
-	if opts.Image == "" {
-		return nil, &InvalidArgumentError{Field: "Image", Message: "image is required"}
+	if (opts.Image == "") == (opts.SnapshotID == "") {
+		return nil, &InvalidArgumentError{Field: "Image/SnapshotID", Message: "exactly one of image or snapshotID is required"}
 	}
 
 	entrypoint := opts.Entrypoint
@@ -117,22 +131,35 @@ func CreateSandbox(ctx context.Context, config ConnectionConfig, opts SandboxCre
 	}
 
 	lc := config.lifecycleClient()
+	startupSource := opts.Image
+	if startupSource == "" {
+		startupSource = opts.SnapshotID
+	}
+	started := time.Now()
 
 	req := CreateSandboxRequest{
-		Image:          ImageSpec{URI: opts.Image, Auth: opts.ImageAuth},
-		Entrypoint:     entrypoint,
-		ResourceLimits: limits,
-		Timeout:        timeout,
-		Env:            opts.Env,
-		SecureAccess:   opts.SecureAccess,
-		Metadata:       opts.Metadata,
-		NetworkPolicy:  opts.NetworkPolicy,
-		Volumes:        opts.Volumes,
-		Extensions:     opts.Extensions,
+		Image:            nil,
+		SnapshotID:       opts.SnapshotID,
+		Entrypoint:       entrypoint,
+		ResourceLimits:   limits,
+		ResourceRequests: opts.ResourceRequests,
+		Timeout:          timeout,
+		Env:              opts.Env,
+		SecureAccess:     opts.SecureAccess,
+		Metadata:         opts.Metadata,
+		NetworkPolicy:    opts.NetworkPolicy,
+		CredentialProxy:  opts.CredentialProxy,
+		Volumes:          opts.Volumes,
+		Extensions:       opts.Extensions,
+		Platform:         opts.Platform,
+	}
+	if opts.Image != "" {
+		req.Image = &ImageSpec{URI: opts.Image, Auth: opts.ImageAuth}
 	}
 
 	created, err := lc.CreateSandbox(ctx, req)
 	if err != nil {
+		reportSandboxCreateMetric(config, "", startupSource, time.Since(started).Milliseconds(), false)
 		return nil, fmt.Errorf("opensandbox: create sandbox: %w", err)
 	}
 
@@ -145,11 +172,13 @@ func CreateSandbox(ctx context.Context, config ConnectionConfig, opts SandboxCre
 	if err := sb.waitForRunning(ctx, opts.ReadyTimeout); err != nil {
 		// Best-effort cleanup
 		_ = lc.DeleteSandbox(context.Background(), created.ID)
+		reportSandboxCreateMetric(config, created.ID, startupSource, time.Since(started).Milliseconds(), false)
 		return nil, err
 	}
 
 	if err := sb.resolveExecd(ctx); err != nil {
 		_ = lc.DeleteSandbox(context.Background(), created.ID)
+		reportSandboxCreateMetric(config, created.ID, startupSource, time.Since(started).Milliseconds(), false)
 		return nil, fmt.Errorf("opensandbox: resolve execd: %w", err)
 	}
 
@@ -161,9 +190,11 @@ func CreateSandbox(ctx context.Context, config ConnectionConfig, opts SandboxCre
 		}
 		if err := sb.WaitUntilReady(ctx, readyOpts); err != nil {
 			_ = lc.DeleteSandbox(context.Background(), created.ID)
+			reportSandboxCreateMetric(config, created.ID, startupSource, time.Since(started).Milliseconds(), false)
 			return nil, err
 		}
 	}
+	reportSandboxCreateMetric(config, created.ID, startupSource, time.Since(started).Milliseconds(), true)
 
 	return sb, nil
 }
@@ -217,23 +248,37 @@ func (s *Sandbox) Resume(ctx context.Context, opts ...ReadyOptions) (*Sandbox, e
 
 // Kill terminates the sandbox. This is irreversible.
 func (s *Sandbox) Kill(ctx context.Context) error {
+	if s.lifecycle.cache != nil {
+		s.lifecycle.cache.Invalidate(s.id)
+	}
 	return s.lifecycle.DeleteSandbox(ctx, s.id)
 }
 
 // Close releases local HTTP resources. Does NOT terminate the sandbox.
-func (s *Sandbox) Close() {
+func (s *Sandbox) Close() error {
 	// No-op for now — Go's http.Client doesn't need explicit close.
 	// Placeholder for future transport pooling.
+	return nil
 }
 
 // Pause pauses the sandbox while preserving its state.
+// Endpoint cache is invalidated because endpoints may change across pause/resume.
 func (s *Sandbox) Pause(ctx context.Context) error {
+	if s.lifecycle.cache != nil {
+		s.lifecycle.cache.Invalidate(s.id)
+	}
 	return s.lifecycle.PauseSandbox(ctx, s.id)
 }
 
 // GetInfo returns the sandbox's current info (status, metadata, image, etc.).
 func (s *Sandbox) GetInfo(ctx context.Context) (*SandboxInfo, error) {
 	return s.lifecycle.GetSandbox(ctx, s.id)
+}
+
+// PatchMetadata patches this sandbox's metadata. Non-nil values add or replace
+// keys. Nil values delete keys.
+func (s *Sandbox) PatchMetadata(ctx context.Context, patch MetadataPatch) (*SandboxInfo, error) {
+	return s.lifecycle.PatchSandboxMetadata(ctx, s.id, patch)
 }
 
 // IsHealthy checks whether the sandbox's execd service is responsive.
@@ -255,6 +300,11 @@ func (s *Sandbox) Ping(ctx context.Context) error {
 // Renew extends the sandbox's expiration by the given duration from now.
 func (s *Sandbox) Renew(ctx context.Context, duration time.Duration) (*RenewExpirationResponse, error) {
 	return s.lifecycle.RenewExpiration(ctx, s.id, time.Now().Add(duration))
+}
+
+// CreateSnapshot creates a persistent snapshot from this sandbox.
+func (s *Sandbox) CreateSnapshot(ctx context.Context, req CreateSnapshotRequest) (*SnapshotInfo, error) {
+	return s.lifecycle.CreateSnapshot(ctx, s.id, req)
 }
 
 // GetEndpoint retrieves the public access endpoint for a service port.
@@ -393,23 +443,19 @@ func (s *Sandbox) resolveExecd(ctx context.Context) error {
 		execdURL = s.config.GetProtocol() + "://" + execdURL
 	}
 
-	token := ""
-	var extraHeaders map[string]string
-	if endpoint.Headers != nil {
-		token = endpoint.Headers["X-EXECD-ACCESS-TOKEN"]
-		// Preserve all endpoint headers (e.g. routing headers) except the auth token
-		extraHeaders = make(map[string]string, len(endpoint.Headers))
-		for k, v := range endpoint.Headers {
-			if k != "X-EXECD-ACCESS-TOKEN" {
-				extraHeaders[k] = v
+	headers := make(map[string]string, len(endpoint.Headers)+1)
+	for k, v := range endpoint.Headers {
+		headers[k] = v
+	}
+	if s.config.UseServerProxy {
+		if _, ok := headers[execdAuthHeader]; !ok {
+			if apiKey := s.config.GetAPIKey(); apiKey != "" {
+				headers[execdAuthHeader] = apiKey
 			}
 		}
 	}
-	if s.config.UseServerProxy && token == "" {
-		token = s.config.GetAPIKey()
-	}
 
-	s.execd = s.config.execdClient(execdURL, token, extraHeaders)
+	s.execd = s.config.execdClient(execdURL, headers)
 	return nil
 }
 
@@ -433,18 +479,18 @@ func (s *Sandbox) resolveEgress(ctx context.Context) error {
 		egressURL = s.config.GetProtocol() + "://" + egressURL
 	}
 
-	token := ""
-	var extraHeaders map[string]string
-	if endpoint.Headers != nil {
-		token = endpoint.Headers["OPENSANDBOX-EGRESS-AUTH"]
-		extraHeaders = make(map[string]string, len(endpoint.Headers))
-		for k, v := range endpoint.Headers {
-			if k != "OPENSANDBOX-EGRESS-AUTH" {
-				extraHeaders[k] = v
+	headers := make(map[string]string, len(endpoint.Headers)+1)
+	for k, v := range endpoint.Headers {
+		headers[k] = v
+	}
+	if s.config.UseServerProxy {
+		if _, ok := headers[egressAuthHeader]; !ok {
+			if apiKey := s.config.GetAPIKey(); apiKey != "" {
+				headers[egressAuthHeader] = apiKey
 			}
 		}
 	}
 
-	s.egress = s.config.egressClient(egressURL, token, extraHeaders)
+	s.egress = s.config.egressClient(egressURL, headers)
 	return nil
 }

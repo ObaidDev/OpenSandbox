@@ -87,6 +87,15 @@ func main() {
 	}
 	log.Infof("dns proxy started on 127.0.0.1:15353")
 
+	logSkipPatterns, err := policy.LoadLogSkipFile()
+	if err != nil {
+		log.Fatalf("failed to load outbound log skip file: %v", err)
+	}
+	if len(logSkipPatterns) > 0 {
+		proxy.SetLogSkip(logSkipPatterns)
+		log.Infof("loaded %d outbound log skip pattern(s) from /var/egress/rules/log_skip.always", len(logSkipPatterns))
+	}
+
 	if blockWebhookURL := strings.TrimSpace(os.Getenv(constants.EnvBlockedWebhook)); blockWebhookURL != "" {
 		blockedBroadcaster := events.NewBroadcaster(ctx, events.BroadcasterConfig{QueueSize: 256})
 		blockedBroadcaster.AddSubscriber(events.NewWebhookSubscriber(blockWebhookURL))
@@ -119,6 +128,9 @@ func main() {
 		log.Fatalf("mitmproxy transparent: %v", err)
 	}
 	mitmGate.MarkStackReady()
+	if mitm != nil {
+		mitm.watchMitmproxy(ctx, mitmGate)
+	}
 
 	if err := startup.RunPost(ctx); err != nil {
 		log.Errorf("startup hooks (post) error: %v", err)

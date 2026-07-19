@@ -17,7 +17,8 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from opensandbox_server.api.schema import ImageSpec, PlatformSpec, Sandbox, SandboxStatus
-from opensandbox_server.services.constants import SANDBOX_ID_LABEL
+from opensandbox_server.extensions import extract_extensions_from_mapping
+from opensandbox_server.services.constants import SANDBOX_ID_LABEL, SANDBOX_SNAPSHOT_ID_LABEL
 
 
 def _is_opensandbox_label(label_key: str) -> bool:
@@ -29,14 +30,17 @@ def _build_sandbox_from_workload(workload: Any, workload_provider: Any) -> Sandb
         metadata = workload.get("metadata", {})
         spec = workload.get("spec", {})
         labels = metadata.get("labels", {})
+        annotations = metadata.get("annotations", {})
         creation_timestamp = metadata.get("creationTimestamp")
     else:
         metadata = workload.metadata
         spec = workload.spec
         labels = metadata.labels or {}
+        annotations = metadata.annotations or {}
         creation_timestamp = metadata.creation_timestamp
 
     sandbox_id = labels.get(SANDBOX_ID_LABEL, "")
+    snapshot_id = labels.get(SANDBOX_SNAPSHOT_ID_LABEL)
     expires_at = workload_provider.get_expiration(workload)
     status_info = workload_provider.get_status(workload)
 
@@ -59,7 +63,9 @@ def _build_sandbox_from_workload(workload: Any, workload_provider: Any) -> Sandb
         image_uri = container.image or ""
         entrypoint = container.command or []
 
-    image_spec = ImageSpec(uri=image_uri) if image_uri else ImageSpec(uri="unknown")
+    image_spec = None
+    if not snapshot_id:
+        image_spec = ImageSpec(uri=image_uri) if image_uri else ImageSpec(uri="unknown")
     platform_spec = _extract_platform_from_workload(workload)
     return Sandbox(
         id=sandbox_id,
@@ -72,7 +78,9 @@ def _build_sandbox_from_workload(workload: Any, workload_provider: Any) -> Sandb
         created_at=creation_timestamp,
         expires_at=expires_at,
         metadata=user_metadata if user_metadata else None,
+        extensions=extract_extensions_from_mapping(annotations),
         image=image_spec,
+        snapshotId=snapshot_id,
         entrypoint=entrypoint,
         platform=platform_spec,
     )
@@ -80,10 +88,12 @@ def _build_sandbox_from_workload(workload: Any, workload_provider: Any) -> Sandb
 
 def _extract_platform_from_workload(workload: Any) -> Optional[PlatformSpec]:
     if isinstance(workload, dict):
-        spec = workload.get("spec", {})
+        spec = workload.get("spec") or {}
+        template = spec.get("template") or {}
+        pod_template = spec.get("podTemplate") or {}
         pod_spec = (
-            spec.get("template", {}).get("spec")
-            or spec.get("podTemplate", {}).get("spec")
+            (template.get("spec") if isinstance(template, dict) else None)
+            or (pod_template.get("spec") if isinstance(pod_template, dict) else None)
             or {}
         )
     else:

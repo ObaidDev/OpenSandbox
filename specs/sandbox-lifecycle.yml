@@ -12,10 +12,10 @@ info:
 
     A sandbox follows this lifecycle:
 
-    1. **Creation** → Sandbox enters `Pending` state (auto-starts)
-    2. **Execution** → Transitions to `Running` state
+    1. **Creation** → Sandbox is provisioned and enters `Running` state
+    2. **Execution** → Sandbox is running and ready to accept requests
     3. **Pause** (optional) → `Pausing` → `Paused` (asynchronous process)
-    4. **Resume** (optional) → Returns to `Running` from `Paused`
+    4. **Resume** (optional) → `Resuming` → `Running` (asynchronous process)
     5. **Termination** → `Stopping` → `Terminated` (can be triggered by kill action, TTL expiry, or error)
     6. **Error** → Any state can transition to `Failed` on critical errors
 
@@ -46,7 +46,48 @@ tags:
     description: Provision and transition sandboxes through their lifecycle
   - name: Snapshots
     description: Create, list, and delete persistent sandbox snapshots
+  - name: Metrics
+    description: Best-effort SDK telemetry ingestion for server-side aggregation
 paths:
+  /metrics/events:
+    post:
+      tags: [Metrics]
+      operationId: reportMetricsEvent
+      summary: Report an SDK metrics event
+      description: |
+        Accepts best-effort telemetry from SDKs (Phase 1: sandbox creation latency).
+
+        SDKs SHOULD fire-and-forget this call after `create` + readiness complete
+        (or after a failed creation attempt). Failures to report MUST NOT affect
+        sandbox usability. The server accepts events even when OpenTelemetry
+        export is disabled (noop recording).
+
+        SDK language and version are taken from the HTTP `User-Agent` header
+        (for example `OpenSandbox-Python-SDK/0.1.14`), not from the JSON body.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MetricsEvent'
+            example:
+              eventType: sandbox.create
+              sandboxId: sbx_01HZYEXAMPLE
+              image: python:3.12
+              createDurationMs: 1842
+              success: true
+      responses:
+        '204':
+          description: Event accepted
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /sandboxes:
     get:
       tags: [ Sandboxes ]
@@ -117,8 +158,8 @@ paths:
         - `snapshotId` to restore from a previously created snapshot.
 
         When `image` is provided, `entrypoint` is required. When `snapshotId` is
-        provided, `entrypoint` must be omitted because the restored snapshot carries
-        its startup process.
+        provided, `entrypoint` is optional. If omitted, the server defaults the
+        sandbox entrypoint to `["tail", "-f", "/dev/null"]`.
 
         ## Authentication
 
@@ -192,22 +233,28 @@ paths:
                   resourceLimits:
                     cpu: "500m"
                     memory: "512Mi"
+              restore-snapshot-with-entrypoint:
+                summary: Restore from a snapshot with a custom entrypoint
+                value:
+                  snapshotId: snap_123
+                  timeout: 3600
+                  resourceLimits:
+                    cpu: "500m"
+                    memory: "512Mi"
+                  entrypoint: ["python", "/workspace/app.py"]
       responses:
         '202':
           description: |
-            Sandbox created and accepted for provisioning.
+            Sandbox created and provisioned successfully.
 
             The returned sandbox includes:
             - `id`: Unique sandbox identifier
-            - `status.state: "Pending"` (auto-starting provisioning or restore)
-            - `status.reason` and `status.message` indicating initialization stage
+            - `status.state: "Running"` (provisioning completed synchronously)
+            - `status.reason` and `status.message` indicating current state
             - `metadata`, `expiresAt`, `createdAt`: Core sandbox information
 
             Note: startup source details and `updatedAt` are not included in the create response.
             Use GET /sandboxes/{sandboxId} to retrieve the complete sandbox information.
-
-            To track provisioning progress, poll GET /sandboxes/{sandboxId}.
-            The sandbox will automatically transition to `Running` state once provisioning or restore completes.
           content:
             application/json:
               schema:
@@ -302,12 +349,21 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '500':
           $ref: '#/components/responses/InternalServerError'
     delete:
       tags: [Snapshots]
       summary: Delete a snapshot
-      description: Delete a persistent sandbox snapshot by id.
+      description: |
+        Delete a persistent sandbox snapshot by id. Snapshots that are still
+        being created cannot be deleted.
+
+        For Kubernetes-backed snapshots, deletion removes OpenSandbox metadata
+        and Kubernetes coordination resources, but does not guarantee removal
+        of pushed OCI images from the configured registry. Use registry
+        retention or garbage collection policies for image lifecycle cleanup.
       responses:
         '204':
           description: Snapshot successfully deleted
@@ -320,6 +376,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '500':
           $ref: '#/components/responses/InternalServerError'
   /sandboxes/{sandboxId}:
@@ -376,14 +434,93 @@ paths:
           $ref: '#/components/responses/Conflict'
         '500':
           $ref: '#/components/responses/InternalServerError'
+  /sandboxes/{sandboxId}/metadata:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    patch:
+      tags: [Sandboxes]
+      summary: Patch sandbox metadata
+      description: |
+        Update sandbox metadata using JSON Merge Patch semantics (RFC 7396).
+
+        **Merge Patch rules:**
+        | Request body key/value | Behavior |
+        |---|---|
+        | `"key": "value"` | Add or replace the key |
+        | `"key": null` | Delete the key (silently ignored if key does not exist) |
+        | key absent | Keep current value (no change) |
+        | Empty `{}` | No-op, returns current metadata |
+
+        Metadata keys and values must comply with Kubernetes label rules:
+        - Keys must be valid DNS label names or prefixed DNS subdomains
+        - Keys with the `opensandbox.io/` prefix are reserved and rejected
+        - Values must be 63 characters or less, matching `[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?`
+
+        This operation does not restart or recreate the sandbox container/pod.
+
+        **Concurrency:** This endpoint uses read-modify-write without optimistic
+        locking (no `resourceVersion` check). Concurrent PATCH requests may
+        interleave and silently drop updates. Use a single writer or coordinate
+        out-of-band when concurrent modifications to the same key are expected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchSandboxMetadataRequest'
+            examples:
+              add-and-replace:
+                summary: Add new keys and replace existing values
+                value:
+                  team: "platform"
+                  version: "2.0"
+              delete-key:
+                summary: Delete a metadata key
+                value:
+                  deprecated-key: null
+              mixed-operations:
+                summary: Add, replace, and delete in a single request
+                value:
+                  project: "new-project"
+                  team: null
+                  environment: "production"
+              empty-body:
+                summary: No-op (returns current metadata)
+                value: {}
+      responses:
+        '200':
+          description: |
+            Metadata patched successfully. Returns the complete sandbox resource
+            with updated metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sandbox'
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
   /sandboxes/{sandboxId}/snapshots:
     post:
       tags: [Snapshots]
       summary: Create a snapshot from a sandbox
       description: |
         Create a persistent point-in-time snapshot from the sandbox's current state.
-        The returned snapshot id identifies the created artifact. Snapshot creation may
-        temporarily pause the sandbox while the runtime captures provider-supported state.
+        The source sandbox must be `Running`. The returned snapshot id identifies
+        the created artifact. Snapshot creation may temporarily pause the sandbox
+        while the runtime captures provider-supported state, then the source
+        sandbox continues running.
       parameters:
         - $ref: '#/components/parameters/SandboxId'
       requestBody:
@@ -433,7 +570,7 @@ paths:
     post:
       tags: [Sandboxes]
       summary: Pause execution while retaining state
-      description: Pause a running sandbox while preserving its state. Poll GET /sandboxes/{sandboxId} to track state transition to Paused.
+      description: Pause a running sandbox while preserving its state. Poll GET /sandboxes/{sandboxId} to track state transition through Pausing and eventually Paused.
       parameters:
         - $ref: '#/components/parameters/SandboxId'
       responses:
@@ -441,7 +578,7 @@ paths:
           description: |
             Pause operation accepted.
 
-            Sandbox will transition to Pausing state.
+            Sandbox will transition to Pausing state and eventually Paused.
             Poll GET /sandboxes/{sandboxId} to track progress.
           headers:
             X-Request-ID:
@@ -460,7 +597,7 @@ paths:
     post:
       tags: [Sandboxes]
       summary: Resume a paused sandbox
-      description: Resume execution of a paused sandbox. Poll GET /sandboxes/{sandboxId} to track state transition to Running.
+      description: Resume execution of a paused sandbox. Poll GET /sandboxes/{sandboxId} to track state transition through Resuming and eventually Running.
       parameters:
         - $ref: '#/components/parameters/SandboxId'
       responses:
@@ -468,7 +605,7 @@ paths:
           description: |
             Resume operation accepted.
 
-            Sandbox will transition from Paused → Running.
+            Sandbox will transition from Paused → Resuming → Running.
             Poll GET /sandboxes/{sandboxId} to track progress.
           headers:
             X-Request-ID:
@@ -541,7 +678,7 @@ paths:
             maximum: 65535
         - name: use_server_proxy
           in: query
-          description: Whether to return a server-proxied URL
+          description: Whether to return a server-proxied URL. Cannot be combined with `expires`.
           schema:
             type: boolean
             default: false
@@ -553,7 +690,7 @@ paths:
             is **Linux / Unix epoch seconds** — a decimal `uint64` count of **whole seconds** since
             the Unix epoch (`1970-01-01 00:00:00` UTC, same as POSIX / `time(2)`), not
             milliseconds. Normalized to `expires_b36` for the four-segment route token. Omit to
-            get the unsigned/legacy response shape.
+            get the unsigned/legacy response shape. Cannot be combined with `use_server_proxy=true`.
           schema:
             type: string
             pattern: '^(0|[1-9][0-9]*)$'
@@ -685,6 +822,33 @@ components:
         X-Request-ID:
           $ref: '#/components/headers/XRequestId'
   schemas:
+    MetricsEvent:
+      type: object
+      description: |
+        SDK-reported metrics event. Phase 1 covers sandbox creation latency from
+        the start of create until readiness succeeds or creation fails.
+
+        SDK language and package version are identified via the request
+        `User-Agent` header (for example `OpenSandbox-Go-SDK/0.1.0`), not body fields.
+      properties:
+        eventType:
+          type: string
+          description: Metric event type
+          enum: [sandbox.create]
+        sandboxId:
+          type: string
+          description: Sandbox identifier when available (may be omitted if create failed before an ID was assigned)
+        image:
+          type: string
+          description: Container image URI or snapshot startup source label
+        createDurationMs:
+          type: integer
+          minimum: 0
+          description: Wall-clock duration in milliseconds from create start to ready or failure
+        success:
+          type: boolean
+          description: Whether create + readiness completed successfully
+      required: [eventType, createDurationMs, success]
     ListSandboxesResponse:
       type: object
       properties:
@@ -746,6 +910,12 @@ components:
           additionalProperties:
             type: string
           description: Custom metadata from creation request
+
+        extensions:
+          type: object
+          additionalProperties:
+            type: string
+          description: Opaque extension data restored from provider-specific storage
 
         platform:
           $ref: '#/components/schemas/PlatformSpec'
@@ -827,6 +997,7 @@ components:
 
         Common state values:
         - Creating: Snapshot creation has been accepted and runtime capture is in progress.
+        - Deleting: Snapshot deletion has been requested and cleanup is in progress.
         - Ready: Snapshot is available for restoring sandboxes.
         - Failed: Snapshot creation failed.
 
@@ -897,6 +1068,12 @@ components:
             type: string
           description: Custom metadata from creation request
 
+        extensions:
+          type: object
+          additionalProperties:
+            type: string
+          description: Opaque extension data restored from provider-specific storage
+
         entrypoint:
           type: array
           items:
@@ -932,6 +1109,7 @@ components:
         - Running: Sandbox is running and ready to accept requests
         - Pausing: Sandbox is in the process of pausing
         - Paused: Sandbox has been paused while retaining its state
+        - Resuming: Sandbox is being restored after a pause
         - Stopping: Sandbox is being terminated
         - Terminated: Sandbox has been successfully terminated
         - Failed: Sandbox encountered a critical error
@@ -940,10 +1118,11 @@ components:
         - Pending → Running (after creation completes)
         - Running → Pausing (when pause is requested)
         - Pausing → Paused (pause operation completes)
-        - Paused → Running (when resume is requested)
+        - Paused → Resuming (when resume is requested)
+        - Resuming → Running (when resume operation completes)
         - Running/Paused → Stopping (when kill is requested or TTL expires)
         - Stopping → Terminated (kill/timeout operation completes)
-        - Pending/Running/Paused → Failed (on error)
+        - Pending/Running/Paused/Resuming → Failed (on error)
 
         Note: New state values may be added in future versions.
         Clients should handle unknown state values gracefully.
@@ -1031,16 +1210,43 @@ components:
           description: Target CPU architecture (for example `amd64` or `arm64`).
           example: arm64
       additionalProperties: false
+    PatchSandboxMetadataRequest:
+      type: object
+      description: |
+        JSON Merge Patch (RFC 7396) request body for updating sandbox metadata.
+
+        The request body is the metadata object itself:
+        - Present keys with non-null values add or replace
+        - Keys with `null` values are deleted
+        - Absent keys are left unchanged
+
+        Keys with the `opensandbox.io/` prefix are reserved and rejected.
+      additionalProperties:
+        type:
+          - string
+          - 'null'
+      example:
+        project: "new-project"
+        team: null
+        environment: "production"
+
     CreateSandboxRequest:
       type: object
-      required: [resourceLimits]
       description: |
-        Request to create a new sandbox from either a container image or a snapshot.
-        Exactly one of `image` or `snapshotId` must be provided.
+        Request to create a new sandbox from either a container image, a snapshot,
+        or a pre-configured pool (via `extensions.poolRef`).
+
+        **Standard mode**: Exactly one of `image` or `snapshotId` must be provided,
+        and `resourceLimits` is required.
 
         When `image` is provided, `entrypoint` is required. When `snapshotId` is
-        provided, `entrypoint` must be omitted because the restored snapshot carries
-        its startup process.
+        provided, `entrypoint` is optional. If omitted, the server defaults the
+        sandbox entrypoint to `["tail", "-f", "/dev/null"]`.
+
+        **Pool mode**: When `extensions.poolRef` is set, the sandbox is created from
+        a pre-configured pool. In this case `image`, `entrypoint`, and
+        `resourceLimits` are all optional (defined by the Pool CRD template).
+        `snapshotId` must not be provided together with `poolRef`.
 
         **Note**: API Key authentication is required via the `OPEN-SANDBOX-API-KEY` header.
       properties:
@@ -1081,8 +1287,20 @@ components:
         resourceLimits:
           $ref: '#/components/schemas/ResourceLimits'
           description: |
-            Runtime resource constraints for the sandbox instance.
+            Runtime resource constraints (hard caps) for the sandbox instance.
+            Required when `extensions.poolRef` is not set.
+            Optional when using pool mode (resource limits are defined by the Pool CRD template).
             SDK clients should provide sensible defaults (e.g., cpu: "500m", memory: "512Mi").
+
+        resourceRequests:
+          $ref: '#/components/schemas/ResourceLimits'
+          description: |
+            Resource reservations (guaranteed minimums) for the sandbox instance.
+            When provided, these values are used as Kubernetes resource `requests`,
+            enabling Burstable QoS class (where `requests < limits`).
+            When omitted, `resourceLimits` values are used for both limits and requests,
+            resulting in Guaranteed QoS class.
+            Only meaningful for Kubernetes-based runtimes; ignored by Docker runtime.
 
         env:
           type: object
@@ -1115,8 +1333,10 @@ components:
           description: |
             The command to execute as the sandbox's entry process.
 
-            Required when `image` is provided. Must be omitted when `snapshotId`
-            is provided because the restored snapshot carries its startup process.
+            Required when `image` is provided.
+
+            Optional when `snapshotId` is provided. If omitted for snapshot
+            restore, the server defaults to `["tail", "-f", "/dev/null"]`.
 
             Explicitly specifies the user's expected main process, allowing the sandbox management
             service to reliably inject control processes before executing this command.
@@ -1138,6 +1358,14 @@ components:
             Optional outbound network policy for the sandbox.
             Shape matches the sidecar `/policy` endpoint. If omitted or empty,
             the sidecar starts in allow-all mode until updated.
+
+        credentialProxy:
+          $ref: '#/components/schemas/CredentialProxyConfig'
+          description: |
+            Optional Credential Vault proxy startup settings. Set `enabled: true`
+            to enable transparent MITM support for credential injection. Plain
+            `networkPolicy` does not enable transparent MITM unless this option
+            is set.
 
         secureAccess:
           type: boolean
@@ -1273,6 +1501,26 @@ components:
             $ref: '#/components/schemas/NetworkRule'
       additionalProperties: false
 
+    CredentialProxyConfig:
+      type: object
+      description: |
+        Credential Vault proxy startup settings. This is an explicit opt-in for
+        transparent MITM support used by credential injection. Credential Vault
+        requires `dns+nft` enforcement and a network policy. A deny-default policy
+        is strongly recommended; default-allow remains temporarily supported for
+        backward compatibility and emits a security warning.
+      properties:
+        enabled:
+          type: boolean
+          default: false
+          description: |
+            When true, the server starts the egress sidecar with transparent
+            MITM enabled and installs the runtime-managed MITM CA bundle into
+            the sandbox container. Requires `networkPolicy` and server
+            `[egress].mode = "dns+nft"`. `defaultAction: deny` is strongly
+            recommended; default-allow support is deprecated.
+      additionalProperties: false
+
     NetworkRule:
       type: object
       properties:
@@ -1381,9 +1629,9 @@ components:
           description: |
             When true, the volume is automatically removed when the sandbox
             is deleted. Only applies to volumes that were auto-created by the
-            server (Docker only). Pre-existing volumes are never removed.
-            Has no effect on Kubernetes PVCs, whose lifecycle is managed by
-            the StorageClass reclaim policy.
+            server on this request; pre-existing volumes are never removed.
+            For Kubernetes, the resulting PVC delete triggers the bound PV's
+            StorageClass reclaim policy (`Retain`/`Delete`).
         storageClass:
           type: string
           nullable: true

@@ -34,6 +34,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	sandboxv1alpha1 "github.com/alibaba/OpenSandbox/sandbox-k8s/apis/sandbox/v1alpha1"
+	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/expectations"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/fieldindex"
 	// +kubebuilder:scaffold:imports
 )
@@ -93,15 +94,17 @@ var _ = BeforeSuite(func() {
 
 	By("setup reconciler")
 	Expect((&BatchSandboxReconciler{
-		Client:   k8sManager.GetClient(),
-		Scheme:   k8sManager.GetScheme(),
-		Recorder: k8sManager.GetEventRecorderFor("test-batch-sandbox-controller"),
+		Client:              k8sManager.GetClient(),
+		Scheme:              k8sManager.GetScheme(),
+		Recorder:            k8sManager.GetEventRecorderFor("test-batch-sandbox-controller"),
+		StatusRVExpectation: expectations.NewResourceVersionExpectation(),
 	}).SetupWithManager(k8sManager, 32)).Should(Succeed())
 	Expect((&PoolReconciler{
-		Client:    k8sManager.GetClient(),
-		Scheme:    k8sManager.GetScheme(),
-		Recorder:  k8sManager.GetEventRecorderFor("test-pool-controller"),
-		Allocator: NewDefaultAllocator(k8sManager.GetClient()),
+		Client:     k8sManager.GetClient(),
+		Scheme:     k8sManager.GetScheme(),
+		Recorder:   k8sManager.GetEventRecorderFor("test-pool-controller"),
+		Allocator:  NewDefaultAllocator(k8sManager.GetClient()),
+		RestConfig: cfg,
 	}).SetupWithManager(k8sManager, 128)).Should(Succeed())
 	// TODO more reconciler goes HERE
 

@@ -37,6 +37,16 @@ import (
 	"github.com/alibaba/opensandbox/execd/pkg/util/pathutil"
 )
 
+var forwardSignals = []os.Signal{
+	syscall.SIGINT,
+	syscall.SIGTERM,
+	syscall.SIGHUP,
+	syscall.SIGQUIT,
+	syscall.SIGUSR1,
+	syscall.SIGUSR2,
+	syscall.SIGWINCH,
+}
+
 // getShell returns the preferred shell, falling back to sh if bash is not available.
 // This is needed for Alpine-based Docker images that only have sh by default.
 func getShell() string {
@@ -90,10 +100,10 @@ func buildCredential(uid, gid *uint32) (*syscall.Credential, error) {
 func (c *Controller) runCommand(ctx context.Context, request *ExecuteCodeRequest) error {
 	session := c.newContextID()
 
-	signals := make(chan os.Signal, 1)
+	signals := make(chan os.Signal, len(forwardSignals)+1)
 	defer close(signals)
-	signal.Notify(signals)
-	defer signal.Reset()
+	signal.Notify(signals, forwardSignals...)
+	defer signal.Stop(signals)
 
 	stdout, stderr, err := c.stdLogDescriptor(session)
 	if err != nil {
@@ -105,7 +115,7 @@ func (c *Controller) runCommand(ctx context.Context, request *ExecuteCodeRequest
 	stderrPath := c.stderrFileName(session)
 
 	startAt := time.Now()
-	log.Info("received command: %v", request.Code)
+	log.Info("received command: %v", log.SanitizeCommand(request.Code))
 	shell := getShell()
 	cmd := exec.CommandContext(ctx, shell, "-c", request.Code)
 	extraEnv := mergeExtraEnvs(loadExtraEnvFromFile(), request.Envs)
@@ -170,7 +180,32 @@ func (c *Controller) runCommand(ctx context.Context, request *ExecuteCodeRequest
 	safego.Go(func() {
 		for {
 			select {
+			case <-done:
+				// cmd.Wait() has returned (or start failed). The pid is
+				// about to be — or already has been — reaped, so we
+				// must not signal it. Execute()'s defer cancel() fires
+				// after every foreground command, including successful
+				// ones, so without this gate the SIGKILL below would
+				// run on a recycled pid/pgid and could kill an
+				// unrelated process group.
+				return
 			case <-ctx.Done():
+				// Re-check `done` to avoid a race with cmd.Wait()
+				// returning concurrently. If cmd.Wait() has just
+				// finished, the leader pid may be reaped and recycled
+				// at any moment; signaling -pid would then target a
+				// foreign process group.
+				select {
+				case <-done:
+					return
+				default:
+				}
+				// Genuine cancellation (timeout, client disconnect,
+				// Interrupt). Kill the whole process group so children
+				// don't outlive the cancelled context.
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
 				return
 			case sig := <-signals:
 				if sig == nil {
@@ -234,13 +269,13 @@ func (c *Controller) runBackgroundCommand(ctx context.Context, cancel context.Ca
 	stdoutPath := c.combinedOutputFileName(session)
 	stderrPath := c.combinedOutputFileName(session)
 
-	signals := make(chan os.Signal, 1)
+	signals := make(chan os.Signal, len(forwardSignals)+1)
 	defer close(signals)
-	signal.Notify(signals)
-	defer signal.Reset()
+	signal.Notify(signals, forwardSignals...)
+	defer signal.Stop(signals)
 
 	startAt := time.Now()
-	log.Info("received command: %v", request.Code)
+	log.Info("received command: %v", log.SanitizeCommand(request.Code))
 	shell := getShell()
 	cmd := exec.CommandContext(ctx, shell, "-c", request.Code)
 	extraEnv := mergeExtraEnvs(loadExtraEnvFromFile(), request.Envs)
@@ -291,12 +326,15 @@ func (c *Controller) runBackgroundCommand(ctx context.Context, cancel context.Ca
 		return fmt.Errorf("failed to start commands: %w", err)
 	}
 
+	// Register the kernel synchronously so that GetCommandStatus callers
+	// can find the session immediately after Execute returns. Previously
+	// this happened inside the goroutine, creating a race where the HTTP
+	// handler could return before the kernel was stored.
+	kernel.pid = cmd.Process.Pid
+	c.storeCommandKernel(session, kernel)
+
 	safego.Go(func() {
 		defer pipe.Close()
-
-		kernel.running = true
-		kernel.pid = cmd.Process.Pid
-		c.storeCommandKernel(session, kernel)
 
 		err = cmd.Wait()
 		cancel()

@@ -25,6 +25,7 @@ import (
 // LifecycleClient provides methods for the OpenSandbox Lifecycle API.
 type LifecycleClient struct {
 	*Client
+	cache *EndpointCache
 }
 
 // NewLifecycleClient creates a new LifecycleClient.
@@ -32,6 +33,15 @@ type LifecycleClient struct {
 func NewLifecycleClient(baseURL, apiKey string, opts ...Option) *LifecycleClient {
 	return &LifecycleClient{
 		Client: NewClient(baseURL, apiKey, "OPEN-SANDBOX-API-KEY", opts...),
+		cache:  NewEndpointCache(0, 0),
+	}
+}
+
+// NewLifecycleClientWithCache creates a LifecycleClient with custom cache settings.
+func NewLifecycleClientWithCache(baseURL, apiKey string, cache *EndpointCache, opts ...Option) *LifecycleClient {
+	return &LifecycleClient{
+		Client: NewClient(baseURL, apiKey, "OPEN-SANDBOX-API-KEY", opts...),
+		cache:  cache,
 	}
 }
 
@@ -88,10 +98,71 @@ func (c *LifecycleClient) CreateSandbox(ctx context.Context, req CreateSandboxRe
 	return &resp, nil
 }
 
+// ListSnapshots returns a paginated list of snapshots with optional filtering.
+func (c *LifecycleClient) ListSnapshots(ctx context.Context, opts ListSnapshotsOptions) (*ListSnapshotsResponse, error) {
+	params := url.Values{}
+	if opts.SandboxID != "" {
+		params.Set("sandboxId", opts.SandboxID)
+	}
+	for _, s := range opts.States {
+		params.Add("state", string(s))
+	}
+	if opts.Page > 0 {
+		params.Set("page", strconv.Itoa(opts.Page))
+	}
+	if opts.PageSize > 0 {
+		params.Set("pageSize", strconv.Itoa(opts.PageSize))
+	}
+
+	path := "/snapshots"
+	if encoded := params.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+
+	var resp ListSnapshotsResponse
+	if err := c.doRequest(ctx, "GET", path, nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// CreateSnapshot creates a snapshot from the given sandbox.
+func (c *LifecycleClient) CreateSnapshot(ctx context.Context, sandboxID string, req CreateSnapshotRequest) (*SnapshotInfo, error) {
+	var resp SnapshotInfo
+	if err := c.doRequest(ctx, "POST", "/sandboxes/"+url.PathEscape(sandboxID)+"/snapshots", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// GetSnapshot retrieves snapshot information by ID.
+func (c *LifecycleClient) GetSnapshot(ctx context.Context, id string) (*SnapshotInfo, error) {
+	var resp SnapshotInfo
+	if err := c.doRequest(ctx, "GET", "/snapshots/"+url.PathEscape(id), nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// DeleteSnapshot deletes a snapshot by ID.
+func (c *LifecycleClient) DeleteSnapshot(ctx context.Context, id string) error {
+	return c.doRequest(ctx, "DELETE", "/snapshots/"+url.PathEscape(id), nil, nil)
+}
+
 // GetSandbox retrieves the complete sandbox information by ID.
 func (c *LifecycleClient) GetSandbox(ctx context.Context, id string) (*SandboxInfo, error) {
 	var resp SandboxInfo
 	if err := c.doRequest(ctx, "GET", "/sandboxes/"+url.PathEscape(id), nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// PatchSandboxMetadata patches metadata for a sandbox. Non-nil values add or
+// replace keys. Nil values delete keys.
+func (c *LifecycleClient) PatchSandboxMetadata(ctx context.Context, id string, patch MetadataPatch) (*SandboxInfo, error) {
+	var resp SandboxInfo
+	if err := c.doRequest(ctx, "PATCH", "/sandboxes/"+url.PathEscape(id)+"/metadata", patch, &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil
@@ -126,9 +197,29 @@ func (c *LifecycleClient) RenewExpiration(ctx context.Context, id string, expire
 }
 
 // GetEndpoint retrieves the public access endpoint for a service running
-// on the specified port inside the sandbox. If useServerProxy is non-nil,
+// on the specified port inside the sandbox. Results are cached with LRU+TTL
+// and deduplicated via singleflight. If useServerProxy is non-nil,
 // the server proxy query parameter is included.
 func (c *LifecycleClient) GetEndpoint(ctx context.Context, sandboxID string, port int, useServerProxy *bool) (*Endpoint, error) {
+	if c.cache == nil {
+		return c.getEndpointFromServer(ctx, sandboxID, port, useServerProxy)
+	}
+
+	key := endpointCacheKey{
+		sandboxID:      sandboxID,
+		port:           port,
+		useServerProxy: useServerProxy != nil && *useServerProxy,
+	}
+
+	// The shared fetch uses a background context so one caller's deadline
+	// doesn't cancel the request for all waiters. Each caller's ctx is
+	// respected via DoChan select in GetOrFetch.
+	return c.cache.GetOrFetch(ctx, key, func() (*Endpoint, error) {
+		return c.getEndpointFromServer(context.Background(), sandboxID, port, useServerProxy)
+	})
+}
+
+func (c *LifecycleClient) getEndpointFromServer(ctx context.Context, sandboxID string, port int, useServerProxy *bool) (*Endpoint, error) {
 	path := fmt.Sprintf("/sandboxes/%s/endpoints/%d", url.PathEscape(sandboxID), port)
 	params := url.Values{}
 	if useServerProxy != nil {

@@ -35,7 +35,9 @@ func readPolicyRequestBody(r *http.Request) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(string(body)), nil
+	raw := strings.TrimSpace(string(body))
+	log.Infof("policy API: request body (%s %s): %s", r.Method, r.URL.Path, raw)
+	return raw, nil
 }
 
 func patchMergedPolicy(base *policy.NetworkPolicy, patchRules []policy.EgressRule) (*policy.NetworkPolicy, error) {
@@ -81,6 +83,32 @@ func mergeEgressRules(base, additions []policy.EgressRule) []policy.EgressRule {
 		out = append(out, r)
 	}
 	return out
+}
+
+// removeRulesByTarget returns a new slice with rules matching targets removed,
+// plus the removed rules. Domain targets are matched case-insensitively.
+// Targets not found are silently ignored.
+func removeRulesByTarget(rules []policy.EgressRule, targets []string) (kept, removed []policy.EgressRule) {
+	if len(targets) == 0 || len(rules) == 0 {
+		return rules, nil
+	}
+	removeSet := make(map[string]struct{}, len(targets))
+	for _, t := range targets {
+		key := strings.ToLower(strings.TrimSpace(t))
+		if key == "" {
+			continue
+		}
+		removeSet[key] = struct{}{}
+	}
+	kept = make([]policy.EgressRule, 0, len(rules))
+	for _, r := range rules {
+		if _, ok := removeSet[strings.ToLower(r.Target)]; ok {
+			removed = append(removed, r)
+		} else {
+			kept = append(kept, r)
+		}
+	}
+	return kept, removed
 }
 
 // mergeKey: domain targets lowercased for dedupe; IP/CIDR left as-is.

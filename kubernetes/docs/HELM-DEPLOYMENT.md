@@ -17,7 +17,7 @@ Download and install the published chart package directly:
 ```bash
 # Install the latest version (0.1.0)
 helm install opensandbox-controller \
-  https://github.com/alibaba/OpenSandbox/releases/download/helm/opensandbox-controller/0.1.0/opensandbox-controller-0.1.0.tgz \
+  https://github.com/opensandbox-group/OpenSandbox/releases/download/helm/opensandbox-controller/0.1.0/opensandbox-controller-0.1.0.tgz \
   --namespace opensandbox-system \
   --create-namespace
 ```
@@ -26,7 +26,7 @@ To use a custom image:
 
 ```bash
 helm install opensandbox-controller \
-  https://github.com/alibaba/OpenSandbox/releases/download/helm/opensandbox-controller/0.1.0/opensandbox-controller-0.1.0.tgz \
+  https://github.com/opensandbox-group/OpenSandbox/releases/download/helm/opensandbox-controller/0.1.0/opensandbox-controller-0.1.0.tgz \
   --set controller.image.repository=<your-registry>/controller \
   --set controller.image.tag=v0.0.1 \
   --namespace opensandbox-system \
@@ -89,7 +89,7 @@ helm list -n opensandbox-system
 ### View Available Versions
 
 Visit GitHub Releases to see all available versions:
-https://github.com/alibaba/OpenSandbox/releases
+https://github.com/opensandbox-group/OpenSandbox/releases
 
 Look for tags starting with `helm/opensandbox-controller/`, such as `helm/opensandbox-controller/0.1.0`
 
@@ -98,7 +98,7 @@ Look for tags starting with `helm/opensandbox-controller/`, such as `helm/opensa
 ```bash
 # Upgrade directly from GitHub Release
 helm upgrade opensandbox-controller \
-  https://github.com/alibaba/OpenSandbox/releases/download/helm/opensandbox-controller/0.2.0/opensandbox-controller-0.2.0.tgz \
+  https://github.com/opensandbox-group/OpenSandbox/releases/download/helm/opensandbox-controller/0.2.0/opensandbox-controller-0.2.0.tgz \
   --namespace opensandbox-system
 ```
 
@@ -123,6 +123,12 @@ controller:
       memory: 128Mi
 
   logLevel: debug
+
+  snapshot:
+    registry: myregistry.example.com/opensandbox/snapshots
+    snapshotPushSecret: registry-snapshot-push-secret
+    imageCommitterPullSecret: registry-image-committer-pull-secret
+    resumePullSecret: registry-pull-secret
 
 imagePullSecrets:
   - name: myregistrykey
@@ -173,6 +179,17 @@ helm install opensandbox-controller ./charts/opensandbox-controller \
   --namespace opensandbox-system
 ```
 
+#### 3. Configure Pause/Resume
+
+```bash
+helm install opensandbox-controller ./charts/opensandbox-controller \
+  --set controller.snapshot.registry=myregistry.example.com/opensandbox/snapshots \
+  --set controller.snapshot.snapshotPushSecret=registry-snapshot-push-secret \
+  --set controller.snapshot.imageCommitterPullSecret=registry-image-committer-pull-secret \
+  --set controller.snapshot.resumePullSecret=registry-pull-secret \
+  --namespace opensandbox-system
+```
+
 ## Upgrade
 
 ### Upgrade Helm Release
@@ -182,7 +199,7 @@ Upgrade from GitHub Release:
 ```bash
 # Upgrade to a specific version
 helm upgrade opensandbox-controller \
-  https://github.com/alibaba/OpenSandbox/releases/download/helm/opensandbox-controller/0.2.0/opensandbox-controller-0.2.0.tgz \
+  https://github.com/opensandbox-group/OpenSandbox/releases/download/helm/opensandbox-controller/0.2.0/opensandbox-controller-0.2.0.tgz \
   --namespace opensandbox-system
 ```
 
@@ -235,6 +252,7 @@ make helm-uninstall
 ```bash
 kubectl delete crd batchsandboxes.sandbox.opensandbox.io
 kubectl delete crd pools.sandbox.opensandbox.io
+kubectl delete crd sandboxsnapshots.sandbox.opensandbox.io
 ```
 
 ### Clean Up Namespace
@@ -433,6 +451,19 @@ This automatically triggers the workflow to:
 4. Create a GitHub Release
 5. Publish the .tgz package to the Release
 
+Important versioning note:
+
+- The Helm chart `version` is the chart package version and is released through
+  `helm/{component}/{version}` tags.
+- The chart `appVersion` is the default image/application version used by that
+  chart release.
+- The `publish-helm-chart.yml` workflow updates `appVersion` for the published
+  release, but intentionally does not auto-bump the chart `version` inside
+  `Chart.yaml` on server release branches.
+- If you need a specific server image release, set the image tag explicitly
+  (for example `--set server.image.tag=v0.1.13`) or publish a new Helm chart
+  package version for the chart itself.
+
 #### Option 2: Manual Trigger
 
 1. Visit the GitHub Actions page
@@ -447,12 +478,12 @@ This automatically triggers the workflow to:
 After publishing, users can access the Helm Chart at:
 
 ```
-https://github.com/alibaba/OpenSandbox/releases/download/helm/{COMPONENT}/{VERSION}/{COMPONENT}-{VERSION}.tgz
+https://github.com/opensandbox-group/OpenSandbox/releases/download/helm/{COMPONENT}/{VERSION}/{COMPONENT}-{VERSION}.tgz
 ```
 
 Example:
 ```
-https://github.com/alibaba/OpenSandbox/releases/download/helm/opensandbox-controller/0.1.0/opensandbox-controller-0.1.0.tgz
+https://github.com/opensandbox-group/OpenSandbox/releases/download/helm/opensandbox-controller/0.1.0/opensandbox-controller-0.1.0.tgz
 ```
 
 ### Adding a New Helm Chart Component
@@ -499,6 +530,6 @@ helm install test-release opensandbox-controller-*.tgz \
 
 ## References
 
-- [Helm Chart README](charts/opensandbox-controller/README.md) - Full parameter list
-- [OpenSandbox Documentation](README.md) - Project documentation
-- [Configuration Examples](config/samples/) - Resource configuration examples
+- [Helm Chart README](../charts/opensandbox-controller/README.md) - Full parameter list
+- [OpenSandbox Documentation](../README.md) - Project documentation
+- [Configuration Examples](../config/samples/) - Resource configuration examples

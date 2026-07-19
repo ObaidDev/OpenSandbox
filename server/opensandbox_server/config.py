@@ -41,6 +41,8 @@ logger = logging.getLogger(__name__)
 CONFIG_ENV_VAR = "SANDBOX_CONFIG_PATH"
 DEFAULT_CONFIG_PATH = Path.home() / ".sandbox.toml"
 
+API_KEY_ENV_VAR = "OPENSANDBOX_SERVER_API_KEY"
+
 _HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?:\.(?!-)[A-Za-z0-9-]{1,63})*$")
 _WILDCARD_DOMAIN_RE = re.compile(r"^\*\.(?!-)[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})+$")
 _IPV4_WITH_PORT_RE = re.compile(r"^(?P<ip>(?:\d{1,3}\.){3}\d{1,3})(?::(?P<port>\d{1,5}))?$")
@@ -136,6 +138,33 @@ class RenewIntentRedisConfig(BaseModel):
                 "[renew_intent] redis.dsn must be set when redis.enabled is true."
             )
         return self
+
+
+class OtelConfig(BaseModel):
+    """Optional OpenTelemetry export for ingested SDK metrics."""
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable OTLP metrics export. When false, SDK events are accepted but recorded as noop."
+        ),
+    )
+    endpoint: Optional[str] = Field(
+        default=None,
+        description=(
+            "OTLP HTTP metrics endpoint. When omitted, OpenTelemetry uses "
+            "OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_EXPORTER_OTLP_METRICS_ENDPOINT."
+        ),
+    )
+    service_name: str = Field(
+        default="opensandbox-server",
+        description="service.name resource attribute for exported metrics.",
+    )
+    export_interval_millis: int = Field(
+        default=60000,
+        ge=1000,
+        description="Periodic export interval in milliseconds.",
+    )
 
 
 class RenewIntentConfig(BaseModel):
@@ -451,6 +480,61 @@ class ServerConfig(BaseModel):
             "Connections idle longer than this may be closed by the server."
         ),
     )
+    limit_concurrency: Optional[int] = Field(
+        default=1024,
+        ge=0,
+        description=(
+            "Maximum concurrent connections before returning 503. "
+            "Set to 0 to disable (TOML cannot express null). "
+            "Provides backpressure protection under burst load."
+        ),
+    )
+
+    @field_validator("limit_concurrency", mode="after")
+    @classmethod
+    def _zero_disables_limit_concurrency(cls, value: Optional[int]) -> Optional[int]:
+        # Translate the TOML-friendly sentinel 0 into None so uvicorn applies
+        # no concurrency cap. TOML has no null literal, so 0 is the only way
+        # to disable the limit from the config file.
+        return None if value == 0 else value
+    timeout_graceful_shutdown: Optional[int] = Field(
+        default=5,
+        ge=1,
+        description=(
+            "Seconds uvicorn waits for in-flight requests to finish before "
+            "forcing shutdown. Ensures Ctrl+C terminates promptly even when "
+            "a long-running operation (e.g. image pull) is in progress."
+        ),
+    )
+    backlog: int = Field(
+        default=2048,
+        ge=1,
+        description="Socket listen backlog passed to uvicorn.",
+    )
+    thread_pool_size: int = Field(
+        default=200,
+        ge=1,
+        description=(
+            "Maximum size of the anyio default threadpool used by FastAPI "
+            "to run sync route handlers. Default anyio limit is 40, which "
+            "throttles bursts of blocking sandbox list/get/delete operations "
+            "under high concurrency."
+        ),
+    )
+    loop: Literal["auto", "uvloop", "asyncio"] = Field(
+        default="auto",
+        description=(
+            "Event loop implementation. 'auto' uses uvloop when available and "
+            "falls back to asyncio. 'asyncio' forces the stdlib loop."
+        ),
+    )
+    http: Literal["auto", "httptools", "h11"] = Field(
+        default="auto",
+        description=(
+            "HTTP protocol parser. 'auto' uses httptools when available and "
+            "falls back to h11."
+        ),
+    )
     api_key: Optional[str] = Field(
         default=None,
         description="Global API key for authenticating incoming lifecycle API calls.",
@@ -534,10 +618,6 @@ class KubernetesRuntimeConfig(BaseModel):
         default=None,
         description="Namespace used for sandbox workloads.",
     )
-    service_account: Optional[str] = Field(
-        default=None,
-        description="Service account bound to sandbox workloads.",
-    )
     workload_provider: Optional[str] = Field(
         default=None,
         description="Workload provider type. If not specified, uses the first registered provider.",
@@ -556,11 +636,27 @@ class KubernetesRuntimeConfig(BaseModel):
         gt=0,
         description="Polling interval in seconds when waiting for a sandbox to become ready after creation.",
     )
+    snapshot_create_timeout_seconds: int = Field(
+        default=15 * 60,
+        ge=1,
+        description=(
+            "Timeout in seconds to wait for a Kubernetes public snapshot to become ready. "
+            "Set this greater than the controller snapshot commit-job-timeout."
+        ),
+    )
     execd_init_resources: Optional["ExecdInitResources"] = Field(
         default=None,
         description=(
             "Resource requests/limits for the execd init container. "
             "If unset, no resource constraints are applied."
+        ),
+    )
+    image_pull_policy: Optional[str] = Field(
+        default="IfNotPresent",
+        description=(
+            "Image pull policy for sandbox containers. "
+            "Values: Always, IfNotPresent, Never. "
+            "Can be overridden per-sandbox via image.pull_policy in create request."
         ),
     )
 
@@ -770,11 +866,95 @@ class DockerConfig(BaseModel):
             "Optional seccomp profile name or path applied to sandbox containers. Leave unset to use Docker's default profile."
         ),
     )
+    port_range_min: int = Field(
+        default=40000,
+        ge=1024,
+        le=65535,
+        description=(
+            "Lower bound of the host port range for bridge-mode sandbox port allocation. "
+            "Must be less than port_range_max. Narrow the range to match your firewall policy."
+        ),
+    )
+    port_range_max: int = Field(
+        default=60000,
+        ge=1024,
+        le=65535,
+        description=(
+            "Upper bound of the host port range for bridge-mode sandbox port allocation. "
+            "Range must span at least 100 ports for reliable allocation. "
+            "Each sandbox needs 2–3 host ports (2 without egress, 3 with egress sidecar)."
+        ),
+    )
     pids_limit: Optional[int] = Field(
         default=4096,
         ge=1,
         description="Maximum number of processes allowed per sandbox container. Set to null to disable the limit.",
     )
+
+    @model_validator(mode="after")
+    def validate_port_range(self) -> "DockerConfig":
+        if self.port_range_min >= self.port_range_max:
+            raise ValueError(
+                f"docker.port_range_min ({self.port_range_min}) must be less than "
+                f"docker.port_range_max ({self.port_range_max})."
+            )
+        if self.port_range_max - self.port_range_min < 100:
+            raise ValueError(
+                f"Port range ({self.port_range_min}-{self.port_range_max}) is too narrow. "
+                f"Need at least 100 ports for reliable allocation."
+            )
+        return self
+
+
+class StoreConfig(BaseModel):
+    """Persistence backend for server-managed server resources."""
+
+    type: Literal["sqlite"] = Field(
+        default="sqlite",
+        description="Server persistence backend type. SQLite is the default local persistent backend.",
+    )
+    path: str = Field(
+        default=str(Path.home() / ".opensandbox" / "opensandbox.db"),
+        description="Filesystem path to the SQLite database used for server metadata persistence.",
+        min_length=1,
+    )
+
+
+class TenantsConfig(BaseModel):
+    """Multi-tenant provider configuration."""
+
+    provider: Literal["file", "http"] = Field(
+        default="file",
+        description="Tenant provider type: 'file' (tenants.toml) or 'http' (remote endpoint).",
+    )
+    endpoint: Optional[str] = Field(
+        default=None,
+        description="HTTP tenant provider endpoint URL. Required when provider='http'.",
+    )
+    max_stale_seconds: float = Field(
+        default=300.0,
+        ge=0,
+        description="Maximum seconds to serve stale cache when HTTP endpoint is unreachable.",
+    )
+    timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        description="HTTP request timeout in seconds.",
+    )
+    auth_header: Optional[str] = Field(
+        default=None,
+        description="Optional header name for provider-level authentication to HTTP endpoint.",
+    )
+    auth_token: Optional[str] = Field(
+        default=None,
+        description="Optional token value for provider-level authentication to HTTP endpoint.",
+    )
+
+    @model_validator(mode="after")
+    def require_endpoint_for_http(self) -> "TenantsConfig":
+        if self.provider == "http" and not self.endpoint:
+            raise ValueError("[tenants] endpoint must be set when provider='http'.")
+        return self
 
 
 class AppConfig(BaseModel):
@@ -785,9 +965,17 @@ class AppConfig(BaseModel):
         default_factory=LogConfig,
         description="Logging configuration (level, file output, rotation).",
     )
+    tenants: Optional[TenantsConfig] = Field(
+        default=None,
+        description="Multi-tenant configuration. When present, enables multi-tenant mode.",
+    )
     renew_intent: RenewIntentConfig = Field(
         default_factory=RenewIntentConfig,
         description="Auto-renew sandbox expiration when reverse-proxy access is observed.",
+    )
+    otel: OtelConfig = Field(
+        default_factory=OtelConfig,
+        description="OpenTelemetry export for SDK metrics ingestion (Phase 1: create latency).",
     )
     runtime: RuntimeConfig = Field(..., description="Sandbox runtime configuration.")
     kubernetes: Optional[KubernetesRuntimeConfig] = None
@@ -795,12 +983,15 @@ class AppConfig(BaseModel):
     ingress: Optional[IngressConfig] = None
     docker: DockerConfig = Field(default_factory=DockerConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
+    store: StoreConfig = Field(
+        default_factory=StoreConfig,
+        description="Persistence backend configuration for server-managed resources.",
+    )
     egress: Optional[EgressConfig] = None
     secure_runtime: Optional[SecureRuntimeConfig] = Field(
         default=None,
         description="Secure container runtime configuration (gVisor, Kata, Firecracker).",
     )
-
     @model_validator(mode="after")
     def validate_runtime_blocks(self) -> "AppConfig":
         if self.runtime.type == "docker":
@@ -858,6 +1049,12 @@ def _load_toml_data(path: Path) -> dict[str, Any]:
         raise
 
 
+def _apply_env_overrides(config: AppConfig) -> None:
+    """Apply environment variable overrides to parsed configuration."""
+    if API_KEY_ENV_VAR in os.environ:
+        config.server.api_key = os.environ[API_KEY_ENV_VAR]
+
+
 def load_config(path: str | Path | None = None) -> AppConfig:
     """
     Load configuration from TOML file and store it globally.
@@ -884,6 +1081,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         logger.error("Invalid configuration in %s: %s", resolved_path, exc)
         raise
 
+    _apply_env_overrides(_config)
     _config_path = resolved_path
     return _config
 
@@ -925,6 +1123,7 @@ __all__ = [
     "INGRESS_MODE_GATEWAY",
     "DockerConfig",
     "StorageConfig",
+    "StoreConfig",
     "KubernetesRuntimeConfig",
     "EgressConfig",
     "EGRESS_MODE_DNS",

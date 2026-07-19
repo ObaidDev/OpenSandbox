@@ -21,7 +21,10 @@ from .create_sandbox_request_env import CreateSandboxRequestEnv
 from .create_sandbox_request_extensions import CreateSandboxRequestExtensions
 from .create_sandbox_request_metadata import CreateSandboxRequestMetadata
 from .create_sandbox_response import CreateSandboxResponse
+from .create_sandbox_response_extensions import CreateSandboxResponseExtensions
 from .create_sandbox_response_metadata import CreateSandboxResponseMetadata
+from .create_snapshot_request import CreateSnapshotRequest
+from .credential_proxy_config import CredentialProxyConfig
 from .endpoint import Endpoint
 from .endpoint_headers import EndpointHeaders
 from .error_response import ErrorResponse
@@ -29,6 +32,7 @@ from .host import Host
 from .image_spec import ImageSpec
 from .image_spec_auth import ImageSpecAuth
 from .list_sandboxes_response import ListSandboxesResponse
+from .list_snapshots_response import ListSnapshotsResponse
 from .network_policy import NetworkPolicy
 from .network_policy_default_action import NetworkPolicyDefaultAction
 from .network_rule import NetworkRule
@@ -36,6 +40,7 @@ from .network_rule_action import NetworkRuleAction
 from .ossfs import OSSFS
 from .ossfs_version import OSSFSVersion
 from .pagination_info import PaginationInfo
+from .patch_sandbox_metadata_request import PatchSandboxMetadataRequest
 from .platform_spec import PlatformSpec
 from .platform_spec_arch import PlatformSpecArch
 from .platform_spec_os import PlatformSpecOs
@@ -44,8 +49,11 @@ from .renew_sandbox_expiration_request import RenewSandboxExpirationRequest
 from .renew_sandbox_expiration_response import RenewSandboxExpirationResponse
 from .resource_limits import ResourceLimits
 from .sandbox import Sandbox
+from .sandbox_extensions import SandboxExtensions
 from .sandbox_metadata import SandboxMetadata
 from .sandbox_status import SandboxStatus
+from .snapshot import Snapshot
+from .snapshot_status import SnapshotStatus
 from .volume import Volume
 
 __all__ = (
@@ -54,7 +62,10 @@ __all__ = (
     "CreateSandboxRequestExtensions",
     "CreateSandboxRequestMetadata",
     "CreateSandboxResponse",
+    "CreateSandboxResponseExtensions",
     "CreateSandboxResponseMetadata",
+    "CreateSnapshotRequest",
+    "CredentialProxyConfig",
     "Endpoint",
     "EndpointHeaders",
     "ErrorResponse",
@@ -62,6 +73,7 @@ __all__ = (
     "ImageSpec",
     "ImageSpecAuth",
     "ListSandboxesResponse",
+    "ListSnapshotsResponse",
     "NetworkPolicy",
     "NetworkPolicyDefaultAction",
     "NetworkRule",
@@ -69,6 +81,7 @@ __all__ = (
     "OSSFS",
     "OSSFSVersion",
     "PaginationInfo",
+    "PatchSandboxMetadataRequest",
     "PlatformSpec",
     "PlatformSpecArch",
     "PlatformSpecOs",
@@ -77,7 +90,10 @@ __all__ = (
     "RenewSandboxExpirationResponse",
     "ResourceLimits",
     "Sandbox",
+    "SandboxExtensions",
     "SandboxMetadata",
     "SandboxStatus",
+    "Snapshot",
+    "SnapshotStatus",
     "Volume",
 )

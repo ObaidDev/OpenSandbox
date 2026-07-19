@@ -9,11 +9,11 @@ import {
   Sandbox,
 } from "../dist/index.js";
 
-function createAdapterFactory() {
+function createAdapterFactory({ includeCredentialVault = true } = {}) {
   const recordedRequests = [];
   const endpointCalls = [];
   const egressStackCalls = [];
-  const egressService = {
+  const policyOnlyEgressService = {
     async getPolicy() {
       return {
         defaultAction: "deny",
@@ -21,7 +21,35 @@ function createAdapterFactory() {
       };
     },
     async patchRules() {},
+    async deleteRules() {},
   };
+  const credentialVaultService = {
+    async create() {
+      return { revision: 1, credentials: [], bindings: [] };
+    },
+    async get() {
+      return { revision: 1, credentials: [], bindings: [] };
+    },
+    async patch() {
+      return { revision: 2, credentials: [], bindings: [] };
+    },
+    async delete() {},
+    async listCredentials() {
+      return [];
+    },
+    async getCredential(name) {
+      return { name, sourceType: "inline", revision: 1 };
+    },
+    async listBindings() {
+      return [];
+    },
+    async getBinding(name) {
+      return { name, revision: 1 };
+    },
+  };
+  const egressService = includeCredentialVault
+    ? { ...policyOnlyEgressService, ...credentialVaultService }
+    : policyOnlyEgressService;
   const sandboxes = {
     async createSandbox(req) {
       recordedRequests.push(req);
@@ -96,6 +124,21 @@ test("Sandbox.create forwards secureAccess", async () => {
   assert.equal(recordedRequests[0].secureAccess, true);
 });
 
+test("Sandbox.create forwards credentialProxy", async () => {
+  const { adapterFactory, recordedRequests } = createAdapterFactory();
+
+  await Sandbox.create({
+    adapterFactory,
+    connectionConfig: { domain: "http://127.0.0.1:8080" },
+    image: "python:3.12",
+    credentialProxy: { enabled: true },
+    skipHealthCheck: true,
+  });
+
+  assert.equal(recordedRequests.length, 1);
+  assert.deepEqual(recordedRequests[0].credentialProxy, { enabled: true });
+});
+
 test("Sandbox.create forwards windows platform values", async () => {
   const { adapterFactory, recordedRequests } = createAdapterFactory();
 
@@ -156,6 +199,62 @@ test("Sandbox.create rejects non-finite timeoutSeconds", async () => {
   }
 });
 
+test("Sandbox.create restores from snapshot without entrypoint", async () => {
+  const { adapterFactory, recordedRequests } = createAdapterFactory();
+
+  await Sandbox.create({
+    adapterFactory,
+    connectionConfig: { domain: "http://127.0.0.1:8080" },
+    snapshotId: "snap-123",
+    skipHealthCheck: true,
+  });
+
+  assert.equal(recordedRequests.length, 1);
+  assert.equal(recordedRequests[0].snapshotId, "snap-123");
+  assert.equal(recordedRequests[0].image, undefined);
+  assert.deepEqual(recordedRequests[0].entrypoint, ["tail", "-f", "/dev/null"]);
+});
+
+test("Sandbox.create restores from snapshot with explicit entrypoint", async () => {
+  const { adapterFactory, recordedRequests } = createAdapterFactory();
+
+  await Sandbox.create({
+    adapterFactory,
+    connectionConfig: { domain: "http://127.0.0.1:8080" },
+    snapshotId: "snap-123",
+    entrypoint: ["python", "app.py"],
+    skipHealthCheck: true,
+  });
+
+  assert.equal(recordedRequests.length, 1);
+  assert.equal(recordedRequests[0].snapshotId, "snap-123");
+  assert.deepEqual(recordedRequests[0].entrypoint, ["python", "app.py"]);
+});
+
+test("Sandbox.create requires exactly one startup source", async () => {
+  const { adapterFactory } = createAdapterFactory();
+
+  await assert.rejects(
+    Sandbox.create({
+      adapterFactory,
+      connectionConfig: { domain: "http://127.0.0.1:8080" },
+      skipHealthCheck: true,
+    }),
+    /Exactly one of image or snapshotId must be provided/
+  );
+
+  await assert.rejects(
+    Sandbox.create({
+      adapterFactory,
+      connectionConfig: { domain: "http://127.0.0.1:8080" },
+      image: "python:3.12",
+      snapshotId: "snap-123",
+      skipHealthCheck: true,
+    }),
+    /Exactly one of image or snapshotId must be provided/
+  );
+});
+
 test("Sandbox creates and reuses egress service during sandbox lifecycle", async () => {
   const { adapterFactory, endpointCalls, egressStackCalls } = createAdapterFactory();
 
@@ -168,11 +267,33 @@ test("Sandbox creates and reuses egress service during sandbox lifecycle", async
 
   await sandbox.getEgressPolicy();
   await sandbox.patchEgressRules([{ action: "allow", target: "www.github.com" }]);
+  const vaultState = await sandbox.credentialVault.get();
 
   assert.deepEqual(endpointCalls, [DEFAULT_EXECD_PORT, DEFAULT_EGRESS_PORT]);
   assert.equal(egressStackCalls.length, 1);
   assert.equal(egressStackCalls[0].egressBaseUrl, `http://127.0.0.1:${DEFAULT_EGRESS_PORT}`);
   assert.deepEqual(egressStackCalls[0].endpointHeaders, { "x-port": String(DEFAULT_EGRESS_PORT) });
+  assert.deepEqual(vaultState, { revision: 1, credentials: [], bindings: [] });
+});
+
+test("Sandbox.create accepts custom egress adapters without Credential Vault methods", async () => {
+  const { adapterFactory } = createAdapterFactory({ includeCredentialVault: false });
+
+  const sandbox = await Sandbox.create({
+    adapterFactory,
+    connectionConfig: { domain: "http://127.0.0.1:8080" },
+    image: "python:3.12",
+    skipHealthCheck: true,
+  });
+
+  assert.deepEqual(await sandbox.getEgressPolicy(), {
+    defaultAction: "deny",
+    egress: [{ action: "allow", target: "pypi.org" }],
+  });
+  await assert.rejects(
+    () => sandbox.credentialVault.get(),
+    /Credential Vault is not available/
+  );
 });
 
 test("Sandbox.create passes OSSFS volume to request", async () => {
@@ -321,4 +442,92 @@ test("Sandbox.create treats null backends as absent", async () => {
 
   assert.equal(recordedRequests.length, 1);
   assert.equal(recordedRequests[0].volumes[0].host.path, "/tmp");
+});
+
+test("Sandbox.create reports create metrics after ready", async () => {
+  const { adapterFactory } = createAdapterFactory();
+  adapterFactory.createExecdStack = () => ({
+    commands: {},
+    files: {},
+    health: {
+      async ping() {
+        return true;
+      },
+    },
+    metrics: {},
+  });
+
+  const metricsPosts = [];
+  let connectionConfig = new ConnectionConfig({
+    domain: "http://127.0.0.1:8080",
+    apiKey: "test-key",
+  });
+  connectionConfig = connectionConfig.withTransportIfMissing();
+  Object.defineProperty(connectionConfig, "fetch", {
+    configurable: true,
+    get() {
+      return async (url, init) => {
+        metricsPosts.push({ url: String(url), init });
+        return { arrayBuffer: async () => new ArrayBuffer(0) };
+      };
+    },
+  });
+
+  await Sandbox.create({
+    adapterFactory,
+    connectionConfig,
+    image: "python:3.12",
+    readyTimeoutSeconds: 1,
+  });
+
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(metricsPosts.length, 1);
+  assert.match(metricsPosts[0].url, /\/v1\/metrics\/events$/);
+  const body = JSON.parse(metricsPosts[0].init.body);
+  assert.equal(body.eventType, "sandbox.create");
+  assert.equal(body.success, true);
+  assert.equal(body.sandboxId, "sandbox-test-id");
+  assert.equal(body.image, "python:3.12");
+  assert.equal(body.sdkLanguage, undefined);
+  assert.equal(body.sdkVersion, undefined);
+  const headers = metricsPosts[0].init.headers || {};
+  const ua = headers["User-Agent"] || headers["user-agent"] || "";
+  assert.match(ua, /^OpenSandbox-JS-SDK\//);
+});
+
+test("Sandbox.create metrics failure does not change create error", async () => {
+  const { adapterFactory } = createAdapterFactory();
+  adapterFactory.createExecdStack = () => ({
+    commands: {},
+    files: {},
+    health: {
+      async ping() {
+        throw new Error("unhealthy");
+      },
+    },
+    metrics: {},
+  });
+
+  const connectionConfig = new ConnectionConfig({
+    domain: "http://127.0.0.1:8080",
+  });
+  Object.defineProperty(connectionConfig, "fetch", {
+    configurable: true,
+    get() {
+      return async () => {
+        throw new Error("metrics down");
+      };
+    },
+  });
+
+  await assert.rejects(
+    Sandbox.create({
+      adapterFactory,
+      connectionConfig,
+      image: "python:3.12",
+      readyTimeoutSeconds: 0.2,
+      healthCheckPollingInterval: 50,
+    }),
+    /timed out|unhealthy|Sandbox/
+  );
 });

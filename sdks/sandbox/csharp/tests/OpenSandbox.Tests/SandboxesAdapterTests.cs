@@ -69,6 +69,7 @@ public class SandboxesAdapterTests
           "image": { "uri": "python:3.11" },
           "platform": { "os": "linux", "arch": "amd64" },
           "entrypoint": ["python"],
+          "extensions": { "opensandbox.extensions.custom-label": "中文数据" },
           "status": { "state": "Running" },
           "createdAt": "2026-03-14T12:00:00Z"
         }
@@ -80,6 +81,8 @@ public class SandboxesAdapterTests
         sandbox.ExpiresAt.Should().BeNull();
         sandbox.Platform.Should().NotBeNull();
         sandbox.Platform!.Arch.Should().Be("amd64");
+        sandbox.Extensions.Should().ContainKey("opensandbox.extensions.custom-label")
+            .WhoseValue.Should().Be("中文数据");
     }
 
     [Fact]
@@ -90,6 +93,7 @@ public class SandboxesAdapterTests
           "id": "sbx-2",
           "status": { "state": "Pending" },
           "platform": { "os": "linux", "arch": "arm64" },
+          "extensions": { "opensandbox.extensions.custom-label": "中文数据" },
           "createdAt": "2026-03-14T12:00:00Z",
           "entrypoint": ["python"]
         }
@@ -106,6 +110,8 @@ public class SandboxesAdapterTests
         response.ExpiresAt.Should().BeNull();
         response.Platform.Should().NotBeNull();
         response.Platform!.Arch.Should().Be("arm64");
+        response.Extensions.Should().ContainKey("opensandbox.extensions.custom-label")
+            .WhoseValue.Should().Be("中文数据");
     }
 
     [Fact]
@@ -127,6 +133,27 @@ public class SandboxesAdapterTests
         handler.RequestBody.Should().NotBeNullOrEmpty();
         using var json = JsonDocument.Parse(handler.RequestBody!);
         json.RootElement.GetProperty("secureAccess").GetBoolean().Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task PatchSandboxMetadataAsync_ShouldSendMetadataBodyAndPreserveNull()
+    {
+        var handler = new CapturePatchMetadataRequestHandler();
+        var client = new HttpClient(handler);
+        var wrapper = new HttpClientWrapper(client, "http://localhost:8080/v1");
+        var adapter = new SandboxesAdapter(wrapper);
+
+        var result = await adapter.PatchSandboxMetadataAsync(
+            "sbx-4",
+            new Dictionary<string, string?> { ["team"] = "platform", ["old"] = null });
+
+        handler.Method.Should().Be(HttpMethod.Patch);
+        handler.PathAndQuery.Should().Be("/v1/sandboxes/sbx-4/metadata");
+        handler.RequestBody.Should().NotBeNullOrEmpty();
+        using var json = JsonDocument.Parse(handler.RequestBody!);
+        json.RootElement.GetProperty("team").GetString().Should().Be("platform");
+        json.RootElement.GetProperty("old").ValueKind.Should().Be(JsonValueKind.Null);
+        result.Metadata.Should().ContainKey("team").WhoseValue.Should().Be("platform");
     }
 
     private static SandboxesAdapter CreateAdapterWithJsonResponse(string payload)
@@ -178,6 +205,36 @@ public class SandboxesAdapterTests
             {
               "id": "sbx-3",
               "status": { "state": "Pending" },
+              "createdAt": "2026-03-14T12:00:00Z",
+              "entrypoint": ["python"]
+            }
+            """;
+            var response = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(payload, Encoding.UTF8, "application/json")
+            };
+            return response;
+        }
+    }
+
+    private sealed class CapturePatchMetadataRequestHandler : HttpMessageHandler
+    {
+        public HttpMethod? Method { get; private set; }
+        public string? PathAndQuery { get; private set; }
+        public string? RequestBody { get; private set; }
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Method = request.Method;
+            PathAndQuery = request.RequestUri?.PathAndQuery;
+            RequestBody = request.Content is null
+                ? null
+                : await request.Content.ReadAsStringAsync();
+            var payload = """
+            {
+              "id": "sbx-4",
+              "status": { "state": "Running" },
+              "metadata": { "team": "platform" },
               "createdAt": "2026-03-14T12:00:00Z",
               "entrypoint": ["python"]
             }

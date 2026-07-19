@@ -18,13 +18,18 @@ from typing import Any, Callable, Dict, Optional
 
 from fastapi import HTTPException, status
 from kubernetes.client import (
+    V1AppArmorProfile,
+    V1Capabilities,
     V1Container,
     V1EnvVar,
     V1ResourceRequirements,
+    V1SeccompProfile,
+    V1SecurityContext,
     V1VolumeMount,
 )
 
 from opensandbox_server.api.schema import ImageSpec
+from opensandbox_server.extensions.keys import ISOLATION_UPPER_MOUNT_PATH
 from opensandbox_server.services.constants import SandboxErrorCodes
 from opensandbox_server.services.helpers import parse_gpu_request
 from opensandbox_server.services.k8s.egress_helper import (
@@ -35,6 +40,9 @@ from opensandbox_server.services.k8s.security_context import (
     build_security_context_from_dict,
     serialize_security_context_to_dict,
 )
+
+# Default entrypoint auto-filled by the SDK when user does not provide one.
+DEFAULT_ENTRYPOINT = ["tail", "-f", "/dev/null"]
 
 _GPU_RESOURCE_LIMIT_KEY = "gpu"
 # Canonical extended-resource name advertised by the NVIDIA device plugin.
@@ -112,10 +120,12 @@ def _build_execd_init_container(
     disable_ipv6_for_egress: bool = False,
 ) -> V1Container:
     script = (
-        "cp ./execd /opt/opensandbox/bin/execd && "
-        "cp ./bootstrap.sh /opt/opensandbox/bin/bootstrap.sh && "
-        "chmod +x /opt/opensandbox/bin/execd && "
-        "chmod +x /opt/opensandbox/bin/bootstrap.sh"
+        "cp ./execd /opt/opensandbox/execd && "
+        "cp ./bootstrap.sh /opt/opensandbox/bootstrap.sh && "
+        "chmod +x /opt/opensandbox/execd && "
+        "chmod +x /opt/opensandbox/bootstrap.sh && "
+        "(cp /usr/local/bin/bwrap /opt/opensandbox/bwrap && "
+        "chmod +x /opt/opensandbox/bwrap || true)"
     )
     security_context = None
     if disable_ipv6_for_egress:
@@ -137,7 +147,7 @@ def _build_execd_init_container(
         volume_mounts=[
             V1VolumeMount(
                 name="opensandbox-bin",
-                mount_path="/opt/opensandbox/bin",
+                mount_path="/opt/opensandbox",
             )
         ],
         resources=resources,
@@ -152,22 +162,30 @@ def _build_main_container(
     resource_limits: Dict[str, str],
     *,
     has_network_policy: bool = False,
+    isolation_enabled: bool = False,
+    image_pull_policy: Optional[str] = None,
+    resource_requests: Optional[Dict[str, str]] = None,
 ) -> V1Container:
     env_vars = [V1EnvVar(name=k, value=v) for k, v in env.items()]
-    env_vars.append(V1EnvVar(name="EXECD", value="/opt/opensandbox/bin/execd"))
+    env_vars.append(V1EnvVar(name="EXECD", value="/opt/opensandbox/execd"))
 
     translated_limits = _translate_resource_limits_for_k8s(resource_limits)
     resources = None
     if translated_limits:
+        translated_requests = (
+            _translate_resource_limits_for_k8s(resource_requests)
+            if resource_requests
+            else translated_limits
+        )
         resources = V1ResourceRequirements(
             limits=translated_limits,
-            requests=translated_limits,
+            requests=translated_requests,
         )
 
     volume_mounts = [
         V1VolumeMount(
             name="opensandbox-bin",
-            mount_path="/opt/opensandbox/bin",
+            mount_path="/opt/opensandbox",
         )
     ]
 
@@ -176,10 +194,29 @@ def _build_main_container(
         security_context_dict = build_security_context_for_sandbox_container(True)
         security_context = build_security_context_from_dict(security_context_dict)
 
+    if isolation_enabled:
+        security_context = security_context or V1SecurityContext()
+        caps = ["SYS_ADMIN"]
+        if security_context.capabilities:
+            existing = security_context.capabilities.add or []
+            caps = sorted(set(existing + caps))
+            security_context.capabilities.add = caps
+        else:
+            security_context.capabilities = V1Capabilities(add=caps)
+        security_context.seccomp_profile = V1SeccompProfile(type="Unconfined")
+        security_context.app_armor_profile = V1AppArmorProfile(type="Unconfined")
+        volume_mounts.append(
+            V1VolumeMount(
+                name="isolation-upper",
+                mount_path=ISOLATION_UPPER_MOUNT_PATH,
+            )
+        )
+
     return V1Container(
         name="sandbox",
         image=image_spec.uri,
-        command=["/opt/opensandbox/bin/bootstrap.sh"] + entrypoint,
+        image_pull_policy=image_pull_policy,
+        command=["/opt/opensandbox/bootstrap.sh"] + entrypoint,
         env=env_vars if env_vars else None,
         resources=resources,
         volume_mounts=volume_mounts,
@@ -192,6 +229,8 @@ def _container_to_dict(container: V1Container) -> Dict[str, Any]:
         "name": container.name,
         "image": container.image,
     }
+    if container.image_pull_policy:
+        result["imagePullPolicy"] = container.image_pull_policy
     if container.command:
         result["command"] = container.command
     if container.args:
@@ -221,11 +260,15 @@ def _workload_platform_constraint_scope(
     pod_template_key: str,
     analyzer: Callable[[Any], tuple[bool, bool]],
 ) -> tuple[bool, bool]:
-    pod_spec = (
-        workload.get("spec", {})
-        .get(pod_template_key, {})
-        .get("spec", {})
-    )
+    # Use `or {}` instead of `.get(key, {})`: when a CRD field is declared
+    # without `omitempty`, Kubernetes serialises an absent value as explicit
+    # null rather than omitting the key.  `.get(key, {})` only substitutes
+    # the default when the key is absent — not when its value is None — so
+    # chaining `.get()` on the result raises AttributeError.  `or {}` treats
+    # both absent keys and explicit None as empty dicts.
+    spec = workload.get("spec") or {}
+    template = spec.get(pod_template_key) or {}
+    pod_spec = template.get("spec") or {}
     return analyzer(pod_spec)
 
 

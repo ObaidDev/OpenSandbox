@@ -36,6 +36,13 @@ func TestE2E(t *testing.T) {
 }
 
 var _ = BeforeSuite(func() {
+	if utils.SkipImageBuild() {
+		_, _ = fmt.Fprintf(GinkgoWriter,
+			"E2E_MODE=%s SKIP_IMAGE_BUILD=true: skipping docker build & kind load (images expected to be pre-built)\n",
+			utils.Mode())
+		return
+	}
+
 	dockerBuildArgs := os.Getenv("DOCKER_BUILD_ARGS")
 
 	By("building the manager(Operator) image")
@@ -56,6 +63,15 @@ var _ = BeforeSuite(func() {
 	_, err = utils.Run(cmd)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the task-executor image")
 
+	By("building the image-committer image")
+	makeArgs = []string{"docker-build-image-committer", fmt.Sprintf("IMAGE_COMMITTER_IMG=%s", utils.ImageCommitterImage)}
+	if dockerBuildArgs != "" {
+		makeArgs = append(makeArgs, fmt.Sprintf("DOCKER_BUILD_ARGS=%s", dockerBuildArgs))
+	}
+	cmd = exec.Command("make", makeArgs...)
+	_, err = utils.Run(cmd)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the image-committer image")
+
 	// If you want to change the e2e test vendor from Kind, ensure the image is
 	// built and available before running the tests. Also, remove the following block.
 	By("loading the manager(Operator) image on Kind")
@@ -65,6 +81,28 @@ var _ = BeforeSuite(func() {
 	By("loading the task-executor image on Kind")
 	err = utils.LoadImageToKindClusterWithName(utils.TaskExecutorImage)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the task-executor image into Kind")
+
+	By("loading the image-committer image on Kind")
+	err = utils.LoadImageToKindClusterWithName(utils.ImageCommitterImage)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the image-committer image into Kind")
+
+	By("pulling the registry image (required for pause/resume tests)")
+	cmd = exec.Command("docker", "pull", "--platform", "linux/amd64", utils.RegistrySourceImage())
+	_, err = utils.Run(cmd)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to pull registry image")
+
+	By("loading the registry image on Kind")
+	err = utils.LoadImageToKindClusterWithName(utils.RegistrySourceImage())
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the registry image into Kind")
+
+	By("pulling the alpine image (required for commit jobs)")
+	cmd = exec.Command("docker", "pull", utils.AlpineImage())
+	_, err = utils.Run(cmd)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to pull alpine image")
+
+	By("loading the alpine image on Kind")
+	err = utils.LoadImageToKindClusterWithName(utils.AlpineImage())
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the alpine image into Kind")
 })
 
 var _ = AfterSuite(func() {

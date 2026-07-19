@@ -32,6 +32,7 @@ from opensandbox_server.config import (
     SecureAccessConfig,
     SecureAccessKey,
     ServerConfig,
+    StoreConfig,
     StorageConfig,
 )
 
@@ -83,6 +84,73 @@ def test_load_config_from_file(tmp_path, monkeypatch):
     assert loaded.kubernetes is not None
 
 
+def test_load_config_env_override_api_key(tmp_path, monkeypatch):
+    """OPENSANDBOX_SERVER_API_KEY should override server.api_key from TOML."""
+    _reset_config(monkeypatch)
+    monkeypatch.setenv("OPENSANDBOX_SERVER_API_KEY", "env-secret-key")
+    toml = textwrap.dedent(
+        """
+        [server]
+        host = "127.0.0.1"
+        port = 9000
+        api_key = "toml-secret-key"
+
+        [runtime]
+        type = "docker"
+        execd_image = "opensandbox/execd:test"
+        """
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(toml)
+
+    loaded = config_module.load_config(config_path)
+    assert loaded.server.api_key == "env-secret-key"
+
+
+def test_load_config_env_api_key_without_toml_key(tmp_path, monkeypatch):
+    """OPENSANDBOX_SERVER_API_KEY should work even when TOML omits api_key."""
+    _reset_config(monkeypatch)
+    monkeypatch.setenv("OPENSANDBOX_SERVER_API_KEY", "env-only-key")
+    toml = textwrap.dedent(
+        """
+        [server]
+        host = "127.0.0.1"
+        port = 9000
+
+        [runtime]
+        type = "docker"
+        execd_image = "opensandbox/execd:test"
+        """
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(toml)
+
+    loaded = config_module.load_config(config_path)
+    assert loaded.server.api_key == "env-only-key"
+
+
+def test_load_config_without_env_uses_toml_api_key(tmp_path, monkeypatch):
+    """When OPENSANDBOX_SERVER_API_KEY is unset, TOML api_key should be used."""
+    _reset_config(monkeypatch)
+    toml = textwrap.dedent(
+        """
+        [server]
+        host = "127.0.0.1"
+        port = 9000
+        api_key = "toml-secret-key"
+
+        [runtime]
+        type = "docker"
+        execd_image = "opensandbox/execd:test"
+        """
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(toml)
+
+    loaded = config_module.load_config(config_path)
+    assert loaded.server.api_key == "toml-secret-key"
+
+
 def test_docker_runtime_disallows_kubernetes_block():
     server_cfg = ServerConfig()
     runtime_cfg = RuntimeConfig(type="docker", execd_image="busybox:latest")
@@ -94,6 +162,73 @@ def test_docker_runtime_disallows_kubernetes_block():
 def test_server_config_defaults_include_max_sandbox_timeout():
     server_cfg = ServerConfig()
     assert server_cfg.max_sandbox_timeout_seconds is None
+
+
+def test_server_config_uvicorn_tuning_defaults():
+    """ServerConfig exposes uvicorn concurrency knobs with sensible defaults."""
+    server_cfg = ServerConfig()
+    assert server_cfg.limit_concurrency == 1024
+    assert server_cfg.backlog == 2048
+    assert server_cfg.thread_pool_size == 200
+    assert server_cfg.loop == "auto"
+    assert server_cfg.http == "auto"
+
+
+def test_server_config_uvicorn_tuning_overrides():
+    server_cfg = ServerConfig(
+        limit_concurrency=256,
+        backlog=4096,
+        loop="uvloop",
+        http="httptools",
+    )
+    assert server_cfg.limit_concurrency == 256
+    assert server_cfg.backlog == 4096
+    assert server_cfg.loop == "uvloop"
+    assert server_cfg.http == "httptools"
+
+
+def test_server_config_limit_concurrency_zero_disables_cap():
+    """0 is the TOML-friendly disable sentinel and must collapse to None so
+    uvicorn applies no concurrency limit."""
+    cfg = ServerConfig(limit_concurrency=0)
+    assert cfg.limit_concurrency is None
+
+
+def test_server_config_limit_concurrency_accepts_none_and_positive():
+    cfg = ServerConfig(limit_concurrency=None)
+    assert cfg.limit_concurrency is None
+    cfg = ServerConfig(limit_concurrency=512)
+    assert cfg.limit_concurrency == 512
+
+
+def test_server_config_limit_concurrency_rejects_negative():
+    with pytest.raises(ValidationError):
+        ServerConfig(limit_concurrency=-1)
+
+
+def test_server_config_backlog_must_be_positive():
+    with pytest.raises(ValidationError):
+        ServerConfig(backlog=0)
+
+
+def test_server_config_thread_pool_size_must_be_positive():
+    with pytest.raises(ValidationError):
+        ServerConfig(thread_pool_size=0)
+    cfg = ServerConfig(thread_pool_size=512)
+    assert cfg.thread_pool_size == 512
+
+
+def test_server_config_loop_and_http_reject_unknown_values():
+    with pytest.raises(ValidationError):
+        ServerConfig(loop="trio")  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        ServerConfig(http="hyper")  # type: ignore[arg-type]
+
+
+def test_store_defaults_to_sqlite():
+    cfg = StoreConfig()
+    assert cfg.type == "sqlite"
+    assert cfg.path.endswith("opensandbox.db")
 
 
 def test_renew_intent_defaults():
@@ -150,6 +285,29 @@ def test_load_config_renew_intent_dotted_redis_keys(tmp_path, monkeypatch):
     assert ar.redis.consumer_concurrency == 4
 
 
+def test_load_config_store_block(tmp_path, monkeypatch):
+    _reset_config(monkeypatch)
+    db_path = tmp_path / "snapshots.sqlite3"
+    escaped_db_path = str(db_path).replace("\\", "\\\\").replace('"', '\\"')
+    toml = textwrap.dedent(
+        f"""
+        [store]
+        type = "sqlite"
+        path = "{escaped_db_path}"
+
+        [runtime]
+        type = "docker"
+        execd_image = "opensandbox/execd:test"
+        """
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(toml)
+
+    loaded = config_module.load_config(config_path)
+    assert loaded.store.type == "sqlite"
+    assert loaded.store.path == str(db_path)
+
+
 def test_load_config_renew_intent_legacy_redis_subtable(tmp_path, monkeypatch):
     """[renew_intent.redis] remains accepted (same parsed shape as dotted keys)."""
     _reset_config(monkeypatch)
@@ -177,6 +335,33 @@ def test_load_config_renew_intent_legacy_redis_subtable(tmp_path, monkeypatch):
     loaded = config_module.load_config(config_path)
     assert loaded.renew_intent.redis.enabled is True
     assert loaded.renew_intent.redis.dsn == "redis://legacy:6379/0"
+
+
+def test_load_config_ignores_legacy_pause_block(tmp_path, monkeypatch):
+    _reset_config(monkeypatch)
+    toml = textwrap.dedent(
+        """
+        [server]
+        host = "127.0.0.1"
+        port = 9000
+
+        [runtime]
+        type = "kubernetes"
+        execd_image = "opensandbox/execd:test"
+
+        [pause]
+        snapshot_registry = "registry.example.com/sandboxes"
+        snapshot_push_secret = "registry-snapshot-push-secret"
+        resume_pull_secret = "registry-pull-secret"
+        snapshot_type = "Rootfs"
+        """
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(toml)
+
+    loaded = config_module.load_config(config_path)
+    assert loaded.runtime.type == "kubernetes"
+    assert not hasattr(loaded, "pause")
 
 
 def test_kubernetes_runtime_fills_missing_block():
